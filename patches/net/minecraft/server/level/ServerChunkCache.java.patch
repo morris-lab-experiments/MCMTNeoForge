@@ -1,5 +1,39 @@
 --- a/net/minecraft/server/level/ServerChunkCache.java
 +++ b/net/minecraft/server/level/ServerChunkCache.java
+@@ -110,6 +_,24 @@
+         return this.lightEngine;
+     }
+ 
++    /**
++     * MCMT hook H5: whether the calling thread may drive this chunk source directly.
++     *
++     * <p>The three call sites that consult this all branch on "am I the main thread?", and the off-thread
++     * branch posts the work to {@link #mainThreadProcessor} and joins the result. Under MCMT the main thread is
++     * parked on the tick barrier for the whole of {@code tickChildren} and will never run that work, so a tick
++     * worker taking the off-thread branch deadlocks. The main-thread branch instead drains the queue itself via
++     * {@code managedBlock}, which is what a worker needs.
++     *
++     * <p>This is only sound while at most one thread drives a given chunk source at a time — true today,
++     * because each {@code ServerLevel} has its own and a level's tick runs on a single worker. Parallelising
++     * ticks <em>within</em> a level makes the {@code lastChunk} cache and {@code getChunkFutureMainThread}
++     * genuinely concurrent, which is what the concurrent-chunk-cache phase is for.
++     */
++    private boolean mcmtCanDriveDirectly() {
++        return Thread.currentThread() == this.mainThread || net.neoforged.neoforge.mcmt.MCMT.isPoolThread();
++    }
++
+     @Nullable
+     private ChunkHolder getVisibleChunkIfPresent(long p_8365_) {
+         return this.chunkMap.getVisibleChunkIfPresent(p_8365_);
+@@ -134,7 +_,7 @@
+     @Nullable
+     @Override
+     public ChunkAccess getChunk(int p_8360_, int p_8361_, ChunkStatus p_330876_, boolean p_8363_) {
+-        if (Thread.currentThread() != this.mainThread) {
++        if (!this.mcmtCanDriveDirectly()) { // MCMT hook H5
+             return CompletableFuture.<ChunkAccess>supplyAsync(() -> this.getChunk(p_8360_, p_8361_, p_330876_, p_8363_), this.mainThreadProcessor).join();
+         } else {
+             ProfilerFiller profilerfiller = this.level.getProfiler();
 @@ -150,6 +_,10 @@
                  }
              }
@@ -11,6 +45,15 @@
              profilerfiller.incrementCounter("getChunkCacheMiss");
              CompletableFuture<ChunkResult<ChunkAccess>> completablefuture = this.getChunkFutureMainThread(p_8360_, p_8361_, p_330876_, p_8363_);
              this.mainThreadProcessor.managedBlock(completablefuture::isDone);
+@@ -167,7 +_,7 @@
+     @Nullable
+     @Override
+     public LevelChunk getChunkNow(int p_8357_, int p_8358_) {
+-        if (Thread.currentThread() != this.mainThread) {
++        if (!this.mcmtCanDriveDirectly()) { // MCMT hook H5
+             return null;
+         } else {
+             this.level.getProfiler().incrementCounter("getChunkNow");
 @@ -184,6 +_,7 @@
              if (chunkholder == null) {
                  return null;
@@ -19,6 +62,15 @@
                  ChunkAccess chunkaccess1 = chunkholder.getChunkIfPresent(ChunkStatus.FULL);
                  if (chunkaccess1 != null) {
                      this.storeInCache(i, chunkaccess1, ChunkStatus.FULL);
+@@ -204,7 +_,7 @@
+     }
+ 
+     public CompletableFuture<ChunkResult<ChunkAccess>> getChunkFuture(int p_8432_, int p_8433_, ChunkStatus p_330326_, boolean p_8435_) {
+-        boolean flag = Thread.currentThread() == this.mainThread;
++        boolean flag = this.mcmtCanDriveDirectly(); // MCMT hook H5
+         CompletableFuture<ChunkResult<ChunkAccess>> completablefuture;
+         if (flag) {
+             completablefuture = this.getChunkFutureMainThread(p_8432_, p_8433_, p_330326_, p_8435_);
 @@ -356,14 +_,14 @@
                  for (ServerChunkCache.ChunkAndHolder serverchunkcache$chunkandholder : list) {
                      LevelChunk levelchunk1 = serverchunkcache$chunkandholder.chunk;

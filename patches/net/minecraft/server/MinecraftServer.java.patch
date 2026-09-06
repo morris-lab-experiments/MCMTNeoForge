@@ -144,19 +144,18 @@
          );
      }
  
-@@ -995,8 +_,10 @@
+@@ -995,8 +_,9 @@
          this.profiler.push("commandFunctions");
          this.getFunctions().tick();
          this.profiler.popPush("levels");
-+        net.neoforged.neoforge.mcmt.MCMT.preTick(this); // MCMT hook H1: opens the parallel tick barrier
++        net.neoforged.neoforge.mcmt.MCMT.preTick(this, this::mcmtRecordLevelTickTime); // MCMT hook H1: opens the parallel tick barrier
  
 -        for (ServerLevel serverlevel : this.getAllLevels()) {
 +        for(ServerLevel serverlevel : this.getWorldArray()) {
-+            long tickStart = Util.getNanos();
              this.profiler.push(() -> serverlevel + " " + serverlevel.dimension().location());
              if (this.tickCount % 20 == 0) {
                  this.profiler.push("timeSync");
-@@ -1005,24 +_,28 @@
+@@ -1005,24 +_,30 @@
              }
  
              this.profiler.push("tick");
@@ -170,14 +169,16 @@
                  serverlevel.fillReportDetails(crashreport);
                  throw new ReportedException(crashreport);
              }
-+            net.neoforged.neoforge.event.EventHooks.fireLevelTickPost(serverlevel, p_129954_);
++            // MCMT hook H1: fireLevelTickPost and the per-dimension timing moved into MCMT, which runs them here
++            // for an inline tick and at the barrier below for a dispatched one.
  
              this.profiler.pop();
              this.profiler.pop();
-+            perWorldTickTimes.computeIfAbsent(serverlevel.dimension(), k -> new long[100])[this.tickCount % 100] = Util.getNanos() - tickStart;
          }
  
-+        net.neoforged.neoforge.mcmt.MCMT.postTick(this); // MCMT hook H1: waits for every dispatched level tick
++        // MCMT hook H1: waits for every dispatched level tick, then fires the deferred LevelTickEvent.Post
++        // listeners on this thread in world order, and rethrows whatever a worker crashed with.
++        net.neoforged.neoforge.mcmt.MCMT.postTick(this, p_129954_);
          this.profiler.popPush("connection");
          this.getConnection().tick();
          this.profiler.popPush("players");
@@ -257,8 +258,34 @@
              return configureRepositoryWithSelection(p_248681_, set, featureflagset, true);
          }
      }
-@@ -1712,6 +_,31 @@
+@@ -1707,11 +_,57 @@
+     }
  
+     public ProfilerFiller getProfiler() {
++        // MCMT hook: ActiveProfiler is a plain fastutil stack with no thread checks, so several tick workers
++        // pushing into it at once corrupts it or throws. It is only ever installed here by /perf start, so
++        // workers simply do not profile.
++        if (net.neoforged.neoforge.mcmt.MCMT.isPoolThread()) {
++            return net.minecraft.util.profiling.InactiveProfiler.INSTANCE;
++        }
+         return this.profiler;
+     }
+ 
++    // MCMT hook H1: the tickChildren loop no longer measures a level tick itself, because under parallel
++    // dispatch it would be measuring how long the handoff took. MCMT calls this with the real duration once
++    // the tick has actually finished.
++    private void mcmtRecordLevelTickTime(ServerLevel level, long nanos) {
++        perWorldTickTimes.computeIfAbsent(level.dimension(), k -> new long[100])[this.tickCount % 100] = nanos;
++    }
++
++    @Override
++    public boolean isSameThread() {
++        // MCMT hook H5: a worker running a level tick is, for every purpose this check exists to serve, the
++        // server thread. Without this, work a worker hands to the server executor would be queued rather than
++        // run, and a worker that then joined the result would deadlock against the barrier in postTick.
++        return super.isSameThread() || net.neoforged.neoforge.mcmt.MCMT.isPoolThread();
++    }
++
      public abstract boolean isSingleplayerOwner(GameProfile p_129840_);
  
 +    private Map<ResourceKey<Level>, long[]> perWorldTickTimes = Maps.newIdentityHashMap();

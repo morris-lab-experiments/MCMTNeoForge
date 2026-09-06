@@ -147,6 +147,7 @@ public final class MCMTCommand {
                 + MCMT.getRunningEntityTicks() + " entity, "
                 + MCMT.getRunningBlockEntityTicks() + " block entity, "
                 + MCMT.getRunningChunkTicks() + " chunk");
+        line(source, "Dispatched", MCMT.getDispatchedLevelTicks() + " level ticks since startup");
         if (MCMTConfig.opsTracing) {
             line(source, "Traced tasks", Integer.toString(MCMT.getCurrentTasks().size()));
         }

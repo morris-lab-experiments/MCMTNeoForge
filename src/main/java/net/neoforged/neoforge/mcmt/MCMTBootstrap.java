@@ -11,6 +11,7 @@ import net.neoforged.fml.ModContainer;
 import net.neoforged.fml.config.ModConfig;
 import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.RegisterCommandsEvent;
+import net.neoforged.neoforge.event.server.ServerAboutToStartEvent;
 import net.neoforged.neoforge.event.server.ServerStoppedEvent;
 import net.neoforged.neoforge.mcmt.commands.MCMTCommand;
 import net.neoforged.neoforge.mcmt.config.MCMTConfig;
@@ -37,6 +38,14 @@ public final class MCMTBootstrap {
         CrashReportCallables.registerCrashCallable("MCMT", MCMT::populateCrashReport);
 
         NeoForge.EVENT_BUS.addListener((RegisterCommandsEvent event) -> MCMTCommand.register(event.getDispatcher()));
+
+        // Build the pool before the first tick rather than lazily inside one: creating a ForkJoinPool and
+        // starting its workers mid-tick would show up as a one-off stall on the very first tick.
+        NeoForge.EVENT_BUS.addListener((ServerAboutToStartEvent event) -> {
+            if (!MCMTConfig.disabled) {
+                MCMTThreadPool.get();
+            }
+        });
         NeoForge.EVENT_BUS.addListener((ServerStoppedEvent event) -> MCMTThreadPool.shutdown());
     }
 }

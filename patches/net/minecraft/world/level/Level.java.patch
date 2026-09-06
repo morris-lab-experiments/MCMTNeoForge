@@ -234,6 +234,17 @@
                          this.neighborChanged(blockstate, blockpos, p_46719_, p_46718_, false);
                      }
                  }
+@@ -1066,6 +_,10 @@
+     }
+ 
+     public ProfilerFiller getProfiler() {
++        // MCMT hook: see MinecraftServer.getProfiler. Tick workers must not touch the shared profiler.
++        if (net.neoforged.neoforge.mcmt.MCMT.isPoolThread()) {
++            return net.minecraft.util.profiling.InactiveProfiler.INSTANCE;
++        }
+         return this.profiler.get();
+     }
+ 
 @@ -1078,6 +_,18 @@
          return this.biomeManager;
      }
