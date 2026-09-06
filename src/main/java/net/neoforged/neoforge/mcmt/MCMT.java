@@ -52,8 +52,7 @@ import org.apache.logging.log4j.Logger;
  * <li>{@link #callTickChunk} dispatches one chunk/environment tick, from {@code ServerChunkCache.tickChunks}.
  * </ol>
  *
- * <p><b>Current state: the level, entity and block-entity hooks dispatch to the pool.</b> The chunk hook is
- * wired but still runs inline on the calling thread.
+ * <p>All four hooks now dispatch to the pool.
  *
  * <h2>The barrier</h2>
  *
@@ -96,6 +95,9 @@ public final class MCMT {
 
     /** As {@link #dispatchedLevelTicks}, for entities. */
     private static final AtomicLong dispatchedEntityTicks = new AtomicLong();
+
+    /** As {@link #dispatchedLevelTicks}, for chunk/environment ticks. */
+    private static final AtomicLong dispatchedChunkTicks = new AtomicLong();
 
     /**
      * Names of the tasks currently in flight, populated only while {@link MCMTConfig#opsTracing} is on. Read by
@@ -470,20 +472,63 @@ public final class MCMT {
         batch.await();
     }
 
-    /** Hook H4. Runs one chunk's environment tick; from {@code ServerChunkCache.tickChunks}. */
-    public static void callTickChunk(ServerLevel level, LevelChunk chunk, int randomTickSpeed) {
-        if (MCMTConfig.disabled || MCMTConfig.disableEnvironment) {
+    /**
+     * Hook H4. Opens a batch for one level's chunk ticks; from {@code ServerChunkCache.tickChunks}, before the
+     * spawn-and-tick loop.
+     */
+    public static TickBatch startChunkTicks(ServerLevel level) {
+        if (!dispatchThisTick || MCMTConfig.disableEnvironment) {
+            return TickBatch.INLINE;
+        }
+        return new TickBatch(new Phaser(1));
+    }
+
+    /**
+     * Hook H4. Runs one chunk's environment tick into the batch; from {@code ServerChunkCache.tickChunks}.
+     *
+     * <p>This is random ticks, precipitation, ice and lightning: the highest block-mutation rate in the game,
+     * and the reason a chunk tick is dispatched by position rather than treated like the other hooks. Fire,
+     * fluids and farmland all write across chunk borders, so the work is genuinely overlapping and the safety
+     * comes from the same place a block entity's does — the chunk locks under {@code setBlock}'s neighbours.
+     *
+     * <p>{@code NaturalSpawner.spawnForChunk} deliberately stays on the calling thread: it consults a
+     * whole-level mob cap that only makes sense evaluated serially.
+     */
+    public static void callTickChunk(TickBatch batch, ServerLevel level, LevelChunk chunk, int randomTickSpeed) {
+        if (batch.isInline()) {
             level.tickChunk(chunk, randomTickSpeed);
             return;
         }
+
         String task = beginTrace("ChunkTick", chunk);
-        runningChunkTicks.incrementAndGet();
+        batch.taskStarted();
         try {
-            level.tickChunk(chunk, randomTickSpeed);
-        } finally {
-            runningChunkTicks.decrementAndGet();
+            MCMTThreadPool.get().execute(() -> {
+                runningChunkTicks.incrementAndGet();
+                try {
+                    level.tickChunk(chunk, randomTickSpeed);
+                } catch (Throwable throwable) {
+                    // No class to demote — a chunk tick is not one object's code — so this is logged and the
+                    // tick abandoned. Losing one chunk's random ticks for one tick is survivable; taking the
+                    // server down for it is not.
+                    LOGGER.error("MCMT: exception ticking chunk {} in {}", chunk.getPos(), level.dimension().location(), throwable);
+                } finally {
+                    runningChunkTicks.decrementAndGet();
+                    endTrace(task);
+                    batch.taskFinished();
+                }
+            });
+            dispatchedChunkTicks.incrementAndGet();
+        } catch (Throwable throwable) {
+            batch.taskFinished();
             endTrace(task);
+            throw throwable;
         }
+    }
+
+    /** Hook H4. Waits for every chunk dispatched into {@code batch}; from {@code ServerChunkCache.tickChunks}. */
+    public static void finishChunkTicks(TickBatch batch) {
+        batch.await();
     }
 
     // Operation tracing
@@ -525,6 +570,11 @@ public final class MCMT {
     /** How many entity ticks have been handed to the pool since startup. */
     public static long getDispatchedEntityTicks() {
         return dispatchedEntityTicks.get();
+    }
+
+    /** How many chunk/environment ticks have been handed to the pool since startup. */
+    public static long getDispatchedChunkTicks() {
+        return dispatchedChunkTicks.get();
     }
 
     public static int getRunningEntityTicks() {

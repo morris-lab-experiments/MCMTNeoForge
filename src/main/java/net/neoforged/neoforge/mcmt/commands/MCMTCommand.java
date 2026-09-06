@@ -151,7 +151,8 @@ public final class MCMTCommand {
                 + MCMT.getRunningChunkTicks() + " chunk");
         line(source, "Dispatched", MCMT.getDispatchedLevelTicks() + " level, "
                 + MCMT.getDispatchedEntityTicks() + " entity, "
-                + MCMT.getDispatchedBlockEntityTicks() + " block entity ticks since startup");
+                + MCMT.getDispatchedBlockEntityTicks() + " block entity, "
+                + MCMT.getDispatchedChunkTicks() + " chunk ticks since startup");
         Set<Class<?>> demoted = SerDesRegistry.autoDemoted();
         if (!demoted.isEmpty()) {
             line(source, "Auto-demoted", demoted.size() + " class(es) chunk-locked after throwing");

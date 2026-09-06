@@ -16,6 +16,8 @@ import net.neoforged.neoforge.event.server.ServerStoppedEvent;
 import net.neoforged.neoforge.mcmt.commands.MCMTCommand;
 import net.neoforged.neoforge.mcmt.config.MCMTConfig;
 import net.neoforged.neoforge.mcmt.parallel.MCMTThreadPool;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.jetbrains.annotations.ApiStatus;
 
 /**
@@ -26,6 +28,8 @@ import org.jetbrains.annotations.ApiStatus;
  */
 @ApiStatus.Internal
 public final class MCMTBootstrap {
+    private static final Logger LOGGER = LogManager.getLogger();
+
     private MCMTBootstrap() {}
 
     /** Called once from the {@code NeoForgeMod} constructor. */
@@ -46,6 +50,18 @@ public final class MCMTBootstrap {
                 MCMTThreadPool.get();
             }
         });
-        NeoForge.EVENT_BUS.addListener((ServerStoppedEvent event) -> MCMTThreadPool.shutdown());
+        NeoForge.EVENT_BUS.addListener((ServerStoppedEvent event) -> {
+            // One line saying what actually got parallelised. Without it the only way to tell a working hook
+            // from a silently inert one is to run /mcmt stats before shutting down, which is no use at all for
+            // an automated run such as the game tests.
+            if (MCMT.getDispatchedLevelTicks() > 0) {
+                LOGGER.info("MCMT dispatched {} level, {} entity, {} block entity and {} chunk ticks this session",
+                        MCMT.getDispatchedLevelTicks(),
+                        MCMT.getDispatchedEntityTicks(),
+                        MCMT.getDispatchedBlockEntityTicks(),
+                        MCMT.getDispatchedChunkTicks());
+            }
+            MCMTThreadPool.shutdown();
+        });
     }
 }

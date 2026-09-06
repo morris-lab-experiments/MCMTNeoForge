@@ -26,6 +26,21 @@
      private final Thread thread;
      private final boolean isDebug;
      private int skyDarken;
+@@ -101,7 +_,13 @@
+     public float rainLevel;
+     public float oThunderLevel;
+     public float thunderLevel;
+-    public final RandomSource random = RandomSource.create();
++    // MCMT hook: every entity, block entity and random tick in this level draws from here, so under MCMT it is
++    // read from every worker at once. LegacyRandomSource carries a ThreadingDetector that throws on exactly
++    // that, which killed mob death-drops mid-tick in soak testing. The thread-safe variant vanilla already
++    // ships advances its seed by compare-and-swap instead.
++    //
++    // Draw order across threads is not reproducible, but MCMT gives up tick determinism anyway.
++    public final RandomSource random = RandomSource.createThreadSafe();
+     @Deprecated
+     private final RandomSource threadSafeRandom = RandomSource.createThreadSafe();
+     private final Holder<DimensionType> dimensionTypeRegistration;
 @@ -114,6 +_,11 @@
      private final RegistryAccess registryAccess;
      private final DamageSources damageSources;

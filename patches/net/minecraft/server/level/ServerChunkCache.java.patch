@@ -175,7 +175,12 @@
          CompletableFuture<ChunkResult<ChunkAccess>> completablefuture;
          if (flag) {
              completablefuture = this.getChunkFutureMainThread(p_8432_, p_8433_, p_330326_, p_8435_);
-@@ -356,14 +_,14 @@
+@@ -352,22 +_,26 @@
+                 Util.shuffle(list, this.level.random);
+                 int k = this.level.getGameRules().getInt(GameRules.RULE_RANDOMTICKING);
+                 boolean flag = this.level.getLevelData().getGameTime() % 400L == 0L;
++                net.neoforged.neoforge.mcmt.TickBatch mcmtBatch = net.neoforged.neoforge.mcmt.MCMT.startChunkTicks(this.level); // MCMT hook H4
+ 
                  for (ServerChunkCache.ChunkAndHolder serverchunkcache$chunkandholder : list) {
                      LevelChunk levelchunk1 = serverchunkcache$chunkandholder.chunk;
                      ChunkPos chunkpos = levelchunk1.getPos();
@@ -188,10 +193,17 @@
  
                          if (this.level.shouldTickBlocksAt(chunkpos.toLong())) {
 -                            this.level.tickChunk(levelchunk1, k);
-+                            net.neoforged.neoforge.mcmt.MCMT.callTickChunk(this.level, levelchunk1, k); // MCMT hook H4
++                            net.neoforged.neoforge.mcmt.MCMT.callTickChunk(mcmtBatch, this.level, levelchunk1, k); // MCMT hook H4
                          }
                      }
                  }
+ 
++                // MCMT hook H4: the custom spawners below and the broadcast that follows both read block state
++                // this loop is still writing, so they wait for it.
++                net.neoforged.neoforge.mcmt.MCMT.finishChunkTicks(mcmtBatch);
+                 profilerfiller.popPush("customSpawners");
+                 if (flag1) {
+                     this.level.tickCustomSpawners(this.spawnEnemies, this.spawnFriendlies);
 @@ -435,11 +_,17 @@
      }
  
