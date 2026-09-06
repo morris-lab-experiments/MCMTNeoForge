@@ -142,7 +142,8 @@ public final class MCMTCommand {
         CommandSourceStack source = ctx.getSource();
         line(source, "MCMT", MCMTConfig.disabled ? "disabled" : "enabled");
         line(source, "Pool", MCMTThreadPool.isStarted()
-                ? MCMTThreadPool.getParallelism() + " workers, " + MCMTThreadPool.getQueuedTaskCount() + " queued"
+                ? MCMTThreadPool.getParallelism() + " target, " + MCMTThreadPool.getPoolSize() + " threads, "
+                        + MCMTThreadPool.getQueuedTaskCount() + " queued"
                 : "not started");
         line(source, "Parallel hooks", describeHooks());
         line(source, "In flight", MCMT.getRunningLevelTicks() + " level, "

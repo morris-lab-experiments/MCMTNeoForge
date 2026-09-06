@@ -339,7 +339,7 @@ public final class MCMT {
         if (!dispatchThisTick || MCMTConfig.disableEntity) {
             return TickBatch.INLINE;
         }
-        return new TickBatch(new Phaser(1));
+        return new TickBatch(true);
     }
 
     /**
@@ -363,9 +363,8 @@ public final class MCMT {
         SerDesPool pool = SerDesRegistry.poolFor(SerDesHookType.ENTITY_TICK, type);
 
         String task = beginTrace("EntityTick", entity);
-        batch.taskStarted();
         try {
-            MCMTThreadPool.get().execute(() -> {
+            batch.dispatch(() -> {
                 runningEntityTicks.incrementAndGet();
                 try {
                     if (pool == null) {
@@ -381,12 +380,10 @@ public final class MCMT {
                 } finally {
                     runningEntityTicks.decrementAndGet();
                     endTrace(task);
-                    batch.taskFinished();
                 }
             });
             dispatchedEntityTicks.incrementAndGet();
         } catch (Throwable throwable) {
-            batch.taskFinished();
             endTrace(task);
             throw throwable;
         }
@@ -409,7 +406,7 @@ public final class MCMT {
         if (!dispatchThisTick || MCMTConfig.disableBlockEntity || !(level instanceof ServerLevel)) {
             return TickBatch.INLINE;
         }
-        return new TickBatch(new Phaser(1));
+        return new TickBatch(true);
     }
 
     /** Hook H3. Ticks one block entity into the batch; from the loop in {@code Level.tickBlockEntities}. */
@@ -423,21 +420,18 @@ public final class MCMT {
         }
 
         String task = beginTrace("BlockEntityTick", blockEntity);
-        batch.taskStarted();
         try {
-            MCMTThreadPool.get().execute(() -> {
+            batch.dispatch(() -> {
                 runningBlockEntityTicks.incrementAndGet();
                 try {
                     runBlockEntityTick(blockEntity, level, type, pool);
                 } finally {
                     runningBlockEntityTicks.decrementAndGet();
                     endTrace(task);
-                    batch.taskFinished();
                 }
             });
             dispatchedBlockEntityTicks.incrementAndGet();
         } catch (Throwable throwable) {
-            batch.taskFinished();
             endTrace(task);
             throw throwable;
         }
@@ -480,7 +474,7 @@ public final class MCMT {
         if (!dispatchThisTick || MCMTConfig.disableEnvironment) {
             return TickBatch.INLINE;
         }
-        return new TickBatch(new Phaser(1));
+        return new TickBatch(true);
     }
 
     /**
@@ -501,9 +495,8 @@ public final class MCMT {
         }
 
         String task = beginTrace("ChunkTick", chunk);
-        batch.taskStarted();
         try {
-            MCMTThreadPool.get().execute(() -> {
+            batch.dispatch(() -> {
                 runningChunkTicks.incrementAndGet();
                 try {
                     level.tickChunk(chunk, randomTickSpeed);
@@ -515,12 +508,10 @@ public final class MCMT {
                 } finally {
                     runningChunkTicks.decrementAndGet();
                     endTrace(task);
-                    batch.taskFinished();
                 }
             });
             dispatchedChunkTicks.incrementAndGet();
         } catch (Throwable throwable) {
-            batch.taskFinished();
             endTrace(task);
             throw throwable;
         }

@@ -52,7 +52,7 @@ public final class ChunkLock {
         for (long target : targets) {
             ReentrantLock lock = this.locks.computeIfAbsent(target, k -> new ReentrantLock());
             // A worker blocked on a chunk lock must tell the pool, or enough of them blocking at once stalls it.
-            RunnableManagedBlocker.runManaged(lock::lock);
+            ManagedLock.lock(lock);
         }
         return targets;
     }

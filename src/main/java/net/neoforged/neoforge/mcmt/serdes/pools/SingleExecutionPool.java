@@ -8,7 +8,7 @@ package net.neoforged.neoforge.mcmt.serdes.pools;
 import java.util.concurrent.locks.ReentrantLock;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.Level;
-import net.neoforged.neoforge.mcmt.parallel.RunnableManagedBlocker;
+import net.neoforged.neoforge.mcmt.parallel.ManagedLock;
 
 /**
  * Runs the task holding one global lock, so no two tasks routed here ever overlap.
@@ -22,7 +22,7 @@ public final class SingleExecutionPool implements SerDesPool {
 
     @Override
     public void serialise(Runnable task, BlockPos pos, Level level) {
-        RunnableManagedBlocker.runManaged(this.lock::lock);
+        ManagedLock.lock(this.lock);
         try {
             task.run();
         } finally {

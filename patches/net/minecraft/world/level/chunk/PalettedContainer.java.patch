@@ -1,10 +1,6 @@
 --- a/net/minecraft/world/level/chunk/PalettedContainer.java
 +++ b/net/minecraft/world/level/chunk/PalettedContainer.java
-@@ -23,23 +_,34 @@
- import net.minecraft.util.ExtraCodecs;
- import net.minecraft.util.Mth;
- import net.minecraft.util.SimpleBitStorage;
--import net.minecraft.util.ThreadingDetector;
+@@ -27,19 +_,31 @@
  import net.minecraft.util.ZeroBitStorage;
  
  public class PalettedContainer<T> implements PaletteResize<T>, PalettedContainerRO<T> {

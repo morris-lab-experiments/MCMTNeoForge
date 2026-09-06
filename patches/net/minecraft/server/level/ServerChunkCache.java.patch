@@ -69,7 +69,7 @@
              return CompletableFuture.<ChunkAccess>supplyAsync(() -> this.getChunk(p_8360_, p_8361_, p_330876_, p_8363_), this.mainThreadProcessor).join();
          } else {
              ProfilerFiller profilerfiller = this.level.getProfiler();
-@@ -142,24 +_,48 @@
+@@ -142,24 +_,51 @@
              long i = ChunkPos.asLong(p_8360_, p_8361_);
  
              for (int j = 0; j < 4; j++) {
@@ -98,9 +98,12 @@
 -            } else {
 -                this.storeInCache(i, chunkaccess1, p_330876_);
 -                return chunkaccess1;
-+            // MCMT hook: one loader at a time per level, and entered through a ManagedBlocker so a worker
-+            // waiting here hands its slot back to the pool instead of starving it.
-+            net.neoforged.neoforge.mcmt.parallel.RunnableManagedBlocker.runManaged(this.mcmtChunkLoadLock::lock);
++            // MCMT hook: one loader at a time per level. Via ManagedLock rather than a plain lock() so that a
++            // worker which genuinely has to wait hands its slot back to the pool -- and, just as importantly,
++            // so that one which does not have to wait costs nothing. This is a cache-miss path taken thousands
++            // of times a tick and almost never contended; blocking the pool's way round on every one of those
++            // grew the pool to ~1500 threads. See ManagedLock.
++            net.neoforged.neoforge.mcmt.parallel.ManagedLock.lock(this.mcmtChunkLoadLock);
 +
 +            try {
 +                // Another thread may have loaded it while we waited for the lock.

@@ -75,6 +75,21 @@ public final class MCMTThreadPool {
         return p == null ? 0 : p.getParallelism();
     }
 
+    /**
+     * Threads the pool has actually started, or zero when no pool has been created.
+     *
+     * <p>Worth reporting separately from {@link #getParallelism()} because the two can diverge wildly, and when
+     * they do it is the interesting fact about the server. A {@code ForkJoinPool} adds threads beyond its
+     * parallelism target to replace workers that have blocked, so a design that blocks workers on pool-internal
+     * waits inflates without bound: an earlier revision of {@code TickBatch} reached 1582 threads against a
+     * target of 32, which cost more in scheduling than the parallelism was worth. A number here far above the
+     * target means something is blocking workers on work the pool itself still has to do.
+     */
+    public static int getPoolSize() {
+        ForkJoinPool p = pool;
+        return p == null ? 0 : p.getPoolSize();
+    }
+
     /** Tasks submitted but not yet finished, or zero when no pool has been created. */
     public static long getQueuedTaskCount() {
         ForkJoinPool p = pool;
