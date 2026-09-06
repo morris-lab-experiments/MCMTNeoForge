@@ -1,0 +1,80 @@
+--- a/net/minecraft/world/level/entity/EntityTickList.java
++++ b/net/minecraft/world/level/entity/EntityTickList.java
+@@ -14,6 +_,18 @@
+     @Nullable
+     private Int2ObjectMap<Entity> iterated;
+ 
++    // MCMT hook H2: guards the three fields above.
++    //
++    // Vanilla already copes with the list changing mid-iteration: an add or remove during forEach copies the
++    // active map aside and swaps, so the iteration carries on over an untouched snapshot. That mechanism is
++    // sound; it simply assumes one thread. Under MCMT an entity ticking on a worker can spawn a child or die,
++    // and those adds and removes land here while the level's own thread is iterating — two threads inside a
++    // fastutil map with no synchronisation at all.
++    //
++    // The lock covers only the bookkeeping, never the callback: forEach captures the map to walk under the
++    // lock and then releases it, so ticking an entity does not block every other entity from being added.
++    private final Object mcmtLock = new Object();
++
+     private void ensureActiveIsNotIterated() {
+         if (this.iterated == this.active) {
+             this.passive.clear();
+@@ -29,30 +_,45 @@
+     }
+ 
+     public void add(Entity p_156909_) {
+-        this.ensureActiveIsNotIterated();
+-        this.active.put(p_156909_.getId(), p_156909_);
++        synchronized (this.mcmtLock) { // MCMT hook H2
++            this.ensureActiveIsNotIterated();
++            this.active.put(p_156909_.getId(), p_156909_);
++        }
+     }
+ 
+     public void remove(Entity p_156913_) {
+-        this.ensureActiveIsNotIterated();
+-        this.active.remove(p_156913_.getId());
++        synchronized (this.mcmtLock) { // MCMT hook H2
++            this.ensureActiveIsNotIterated();
++            this.active.remove(p_156913_.getId());
++        }
+     }
+ 
+     public boolean contains(Entity p_156915_) {
+-        return this.active.containsKey(p_156915_.getId());
++        synchronized (this.mcmtLock) { // MCMT hook H2
++            return this.active.containsKey(p_156915_.getId());
++        }
+     }
+ 
+     public void forEach(Consumer<Entity> p_156911_) {
+-        if (this.iterated != null) {
+-            throw new UnsupportedOperationException("Only one concurrent iteration supported");
+-        } else {
++        Int2ObjectMap<Entity> toIterate;
++        synchronized (this.mcmtLock) { // MCMT hook H2
++            if (this.iterated != null) {
++                throw new UnsupportedOperationException("Only one concurrent iteration supported");
++            }
++
+             this.iterated = this.active;
++            toIterate = this.active;
++        }
+ 
+-            try {
+-                for (Entity entity : this.active.values()) {
+-                    p_156911_.accept(entity);
+-                }
+-            } finally {
++        try {
++            // Deliberately outside the lock. Nothing mutates this map once it is the iterated one — an add or
++            // remove copies the map aside and swaps instead — so walking it unlocked is safe, and it means a
++            // slow entity tick does not block every other entity from being added or removed.
++            for (Entity entity : toIterate.values()) {
++                p_156911_.accept(entity);
++            }
++        } finally {
++            synchronized (this.mcmtLock) {
+                 this.iterated = null;
+             }
+         }

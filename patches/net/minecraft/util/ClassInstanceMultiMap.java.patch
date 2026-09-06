@@ -1,0 +1,97 @@
+--- a/net/minecraft/util/ClassInstanceMultiMap.java
++++ b/net/minecraft/util/ClassInstanceMultiMap.java
+@@ -14,9 +_,23 @@
+ import net.minecraft.Util;
+ 
+ public class ClassInstanceMultiMap<T> extends AbstractCollection<T> {
+-    private final Map<Class<?>, List<T>> byClass = Maps.newHashMap();
++    // MCMT hook H2: one of these backs every entity section, and it is the busiest shared structure in a
++    // parallel entity tick. Nearly every mob tick reads it — pushEntities, target selection, breeding, all go
++    // through Level.getEntities and end up iterating these lists — while any entity crossing a section
++    // boundary writes to it. On plain ArrayLists that is a ConcurrentModificationException in the middle of a
++    // mob's aiStep, which is exactly what the soak produced.
++    //
++    // Copy-on-write fits the access pattern almost exactly: reads are lock-free and iterate a stable snapshot,
++    // and writes only happen when an entity actually changes section, which is rare next to how often these
++    // are read. A reader seeing a snapshot from a moment ago is not a correctness problem — single-threaded
++    // vanilla equally gives you whatever the list held when you asked.
++    private final Map<Class<?>, List<T>> byClass = new java.util.concurrent.ConcurrentHashMap<>();
+     private final Class<T> baseClass;
+-    private final List<T> allInstances = Lists.newArrayList();
++    private final List<T> allInstances = new java.util.concurrent.CopyOnWriteArrayList<>();
++
++    // Serialises structural writes so that add/remove, which walk every per-class list, cannot interleave with
++    // find() building a new one and lose an entity from it. Reads never take this.
++    private final Object mcmtWriteLock = new Object();
+ 
+     public ClassInstanceMultiMap(Class<T> p_13531_) {
+         this.baseClass = p_13531_;
+@@ -25,29 +_,33 @@
+ 
+     @Override
+     public boolean add(T p_13536_) {
+-        boolean flag = false;
++        synchronized (this.mcmtWriteLock) { // MCMT hook H2
++            boolean flag = false;
+ 
+-        for (Entry<Class<?>, List<T>> entry : this.byClass.entrySet()) {
+-            if (entry.getKey().isInstance(p_13536_)) {
+-                flag |= entry.getValue().add(p_13536_);
++            for (Entry<Class<?>, List<T>> entry : this.byClass.entrySet()) {
++                if (entry.getKey().isInstance(p_13536_)) {
++                    flag |= entry.getValue().add(p_13536_);
++                }
+             }
++
++            return flag;
+         }
+-
+-        return flag;
+     }
+ 
+     @Override
+     public boolean remove(Object p_13543_) {
+-        boolean flag = false;
++        synchronized (this.mcmtWriteLock) { // MCMT hook H2
++            boolean flag = false;
+ 
+-        for (Entry<Class<?>, List<T>> entry : this.byClass.entrySet()) {
+-            if (entry.getKey().isInstance(p_13543_)) {
+-                List<T> list = entry.getValue();
+-                flag |= list.remove(p_13543_);
++            for (Entry<Class<?>, List<T>> entry : this.byClass.entrySet()) {
++                if (entry.getKey().isInstance(p_13543_)) {
++                    List<T> list = entry.getValue();
++                    flag |= list.remove(p_13543_);
++                }
+             }
++
++            return flag;
+         }
+-
+-        return flag;
+     }
+ 
+     @Override
+@@ -59,8 +_,19 @@
+         if (!this.baseClass.isAssignableFrom(p_13534_)) {
+             throw new IllegalArgumentException("Don't know how to search for " + p_13534_);
+         } else {
+-            List<? extends T> list = this.byClass
+-                .computeIfAbsent(p_13534_, p_337572_ -> this.allInstances.stream().filter(p_337572_::isInstance).collect(Util.toMutableList()));
++            // MCMT hook H2: the common case is a hit, which needs no lock. Building a missing list does,
++            // because it snapshots allInstances and must not race an add that has already walked past the
++            // entry it is about to create — the added entity would be missing from this class for good.
++            List<? extends T> list = this.byClass.get(p_13534_);
++            if (list == null) {
++                synchronized (this.mcmtWriteLock) {
++                    list = this.byClass.computeIfAbsent(
++                        p_13534_,
++                        p_337572_ -> this.allInstances.stream().filter(p_337572_::isInstance).collect(java.util.stream.Collectors.toCollection(java.util.concurrent.CopyOnWriteArrayList::new))
++                    );
++                }
++            }
++
+             return (Collection<S>)Collections.unmodifiableCollection(list);
+         }
+     }

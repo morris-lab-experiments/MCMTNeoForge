@@ -52,9 +52,8 @@ import org.apache.logging.log4j.Logger;
  * <li>{@link #callTickChunk} dispatches one chunk/environment tick, from {@code ServerChunkCache.tickChunks}.
  * </ol>
  *
- * <p><b>Current state: {@link #callTick} and {@link #callBlockEntityTick} dispatch to the pool.</b> The entity
- * and chunk hooks are wired but still run inline on the calling thread; they are switched over one phase at a
- * time.
+ * <p><b>Current state: the level, entity and block-entity hooks dispatch to the pool.</b> The chunk hook is
+ * wired but still runs inline on the calling thread.
  *
  * <h2>The barrier</h2>
  *
@@ -94,6 +93,9 @@ public final class MCMT {
 
     /** As {@link #dispatchedLevelTicks}, for block entities. */
     private static final AtomicLong dispatchedBlockEntityTicks = new AtomicLong();
+
+    /** As {@link #dispatchedLevelTicks}, for entities. */
+    private static final AtomicLong dispatchedEntityTicks = new AtomicLong();
 
     /**
      * Names of the tasks currently in flight, populated only while {@link MCMTConfig#opsTracing} is on. Read by
@@ -327,25 +329,70 @@ public final class MCMT {
     }
 
     /**
-     * Hook H2. Ticks one entity; from the {@code entityTickList.forEach} lambda in {@code ServerLevel.tick}.
+     * Hook H2. Opens a batch for one level's entity ticks; from {@code ServerLevel.tick}, before the entity
+     * loop. Closed by {@link #finishEntityTicks} before {@code tickBlockEntities}, so entity and block-entity
+     * ticks never overlap within a level.
+     */
+    public static TickBatch startEntityTicks(ServerLevel level) {
+        if (!dispatchThisTick || MCMTConfig.disableEntity) {
+            return TickBatch.INLINE;
+        }
+        return new TickBatch(new Phaser(1));
+    }
+
+    /**
+     * Hook H2. Ticks one entity into the batch; from the {@code entityTickList.forEach} lambda in
+     * {@code ServerLevel.tick}.
      *
      * <p>{@code ticker} is the level's cached guarded-tick consumer, which wraps {@code tickNonPassenger} in
      * {@code guardEntityTick}'s crash reporting. It is passed in rather than reconstructed here so that the hot
      * path allocates nothing.
      */
-    public static void callEntityTick(Consumer<Entity> ticker, Entity entity, ServerLevel level) {
-        if (MCMTConfig.disabled || MCMTConfig.disableEntity) {
+    public static void callEntityTick(TickBatch batch, Consumer<Entity> ticker, Entity entity, ServerLevel level) {
+        // Portal transit is decided per entity rather than per class, so it cannot live in a SerDes filter. An
+        // entity mid-portal is about to be removed from this level and added to another, which touches two
+        // levels' entity managers at once; the dispatching thread is the only safe place for that.
+        if (batch.isInline() || entity.portalProcess != null) {
             ticker.accept(entity);
             return;
         }
+
+        Class<?> type = entity.getClass();
+        SerDesPool pool = SerDesRegistry.poolFor(SerDesHookType.ENTITY_TICK, type);
+
         String task = beginTrace("EntityTick", entity);
-        runningEntityTicks.incrementAndGet();
+        batch.taskStarted();
         try {
-            ticker.accept(entity);
-        } finally {
-            runningEntityTicks.decrementAndGet();
+            MCMTThreadPool.get().execute(() -> {
+                runningEntityTicks.incrementAndGet();
+                try {
+                    if (pool == null) {
+                        ticker.accept(entity);
+                    } else {
+                        pool.serialise(() -> ticker.accept(entity), entity.blockPosition(), level);
+                    }
+                } catch (Throwable throwable) {
+                    // Same reasoning as runBlockEntityTick: demote rather than crash. guardEntityTick already
+                    // absorbs most of what an entity tick can throw, so reaching here means MCMT's own doing.
+                    SerDesRegistry.demote(type, throwable);
+                    LOGGER.error("MCMT: exception ticking entity {} at {}", type.getName(), entity.blockPosition(), throwable);
+                } finally {
+                    runningEntityTicks.decrementAndGet();
+                    endTrace(task);
+                    batch.taskFinished();
+                }
+            });
+            dispatchedEntityTicks.incrementAndGet();
+        } catch (Throwable throwable) {
+            batch.taskFinished();
             endTrace(task);
+            throw throwable;
         }
+    }
+
+    /** Hook H2. Waits for every entity dispatched into {@code batch}; from {@code ServerLevel.tick}. */
+    public static void finishEntityTicks(TickBatch batch) {
+        batch.await();
     }
 
     /**
@@ -473,6 +520,11 @@ public final class MCMT {
     /** How many block-entity ticks have been handed to the pool since startup. */
     public static long getDispatchedBlockEntityTicks() {
         return dispatchedBlockEntityTicks.get();
+    }
+
+    /** How many entity ticks have been handed to the pool since startup. */
+    public static long getDispatchedEntityTicks() {
+        return dispatchedEntityTicks.get();
     }
 
     public static int getRunningEntityTicks() {

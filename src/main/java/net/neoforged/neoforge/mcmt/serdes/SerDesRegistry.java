@@ -13,6 +13,7 @@ import net.neoforged.neoforge.mcmt.config.MCMTConfig;
 import net.neoforged.neoforge.mcmt.serdes.filter.AutoFilter;
 import net.neoforged.neoforge.mcmt.serdes.filter.ConfigFilter;
 import net.neoforged.neoforge.mcmt.serdes.filter.DefaultFilter;
+import net.neoforged.neoforge.mcmt.serdes.filter.EntityFilter;
 import net.neoforged.neoforge.mcmt.serdes.filter.PistonFilter;
 import net.neoforged.neoforge.mcmt.serdes.filter.SerDesFilter;
 import net.neoforged.neoforge.mcmt.serdes.filter.VanillaFilter;
@@ -27,8 +28,8 @@ import net.neoforged.neoforge.mcmt.serdes.pools.SingleExecutionPool;
  * <p>Filters are consulted in priority order and the first opinion wins:
  *
  * <ol>
- * <li>{@link PistonFilter} — vanilla classes known to reach outside themselves. Not overridable, because
- * overriding them does not make them safe.
+ * <li>{@link PistonFilter} and {@link EntityFilter} — vanilla classes known to reach outside themselves. Not
+ * overridable, because overriding them does not make them safe.
  * <li>{@link ConfigFilter} — the server owner's white and black lists.
  * <li>{@link AutoFilter} — classes that have already thrown once while running in parallel.
  * <li>{@link VanillaFilter} — everything else in {@code net.minecraft} runs free.
@@ -58,6 +59,7 @@ public final class SerDesRegistry {
 
     private static final List<SerDesFilter> FILTERS = List.of(
             new PistonFilter(CHUNK_LOCK),
+            new EntityFilter(SINGLE),
             new ConfigFilter(CHUNK_LOCK),
             AUTO,
             new VanillaFilter(),

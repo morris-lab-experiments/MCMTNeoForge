@@ -1,6 +1,25 @@
 --- a/net/minecraft/world/level/entity/PersistentEntitySectionManager.java
 +++ b/net/minecraft/world/level/entity/PersistentEntitySectionManager.java
-@@ -71,7 +_,16 @@
+@@ -32,6 +_,18 @@
+ public class PersistentEntitySectionManager<T extends EntityAccess> implements AutoCloseable {
+     static final Logger LOGGER = LogUtils.getLogger();
+     final Set<UUID> knownUuids = Sets.newHashSet();
++
++    // MCMT hook H2: serialises structural changes to this level's entity storage.
++    //
++    // Adding, removing and re-sectioning an entity all walk the same non-concurrent structures — knownUuids, the
++    // EntitySectionStorage, the level's tick list, and ChunkMap's entity map. Vanilla never needed a lock because
++    // only the server thread ever got here. Under MCMT any ticking entity can spawn a child, die, or cross a
++    // section boundary, so several workers reach this at once and corrupt a fastutil map — which then throws
++    // somewhere else entirely, a tick or a minute later, with nothing in the stack to say why.
++    //
++    // Serialising this costs little: entities tick constantly but are created, destroyed and re-sectioned rarely,
++    // and the lock covers none of the ticking itself.
++    final Object mcmtStructuralLock = new Object();
+     final LevelCallback<T> callbacks;
+     private final EntityPersistentStorage<T> permanentStorage;
+     private final EntityLookup<T> visibleEntityStorage;
+@@ -71,7 +_,22 @@
          return this.addEntity(p_157534_, false);
      }
  
@@ -14,6 +33,12 @@
 +    }
 +
 +    private boolean addEntityWithoutEvent(T p_157539_, boolean p_157540_) {
++        synchronized (this.mcmtStructuralLock) { // MCMT hook H2
++            return this.addEntityWithoutEventLocked(p_157539_, p_157540_);
++        }
++    }
++
++    private boolean addEntityWithoutEventLocked(T p_157539_, boolean p_157540_) {
          if (!this.addEntityUuid(p_157539_)) {
              return false;
          } else {
@@ -63,6 +88,24 @@
              this.currentSectionKey = p_157615_;
              this.currentSection = p_157616_;
          }
+@@ -381,6 +_,17 @@
+             BlockPos blockpos = this.entity.blockPosition();
+             long i = SectionPos.asLong(blockpos);
+             if (i != this.currentSectionKey) {
++                // MCMT hook H2: crossing a section boundary re-sections the entity, which is a structural
++                // change like add and remove. Cheap to guard because the common case — the entity did not
++                // change section — never reaches here.
++                synchronized (PersistentEntitySectionManager.this.mcmtStructuralLock) {
++                    this.onSectionChangeLocked(blockpos, i);
++                }
++            }
++        }
++
++        private void onSectionChangeLocked(BlockPos blockpos, long i) {
++            {
+                 Visibility visibility = this.currentSection.getStatus();
+                 if (!this.currentSection.remove(this.entity)) {
+                     PersistentEntitySectionManager.LOGGER
 @@ -390,9 +_,11 @@
                  PersistentEntitySectionManager.this.removeSectionIfEmpty(this.currentSectionKey, this.currentSection);
                  EntitySection<T> entitysection = PersistentEntitySectionManager.this.sectionStorage.getOrCreateSection(i);
@@ -75,3 +118,16 @@
              }
          }
  
+@@ -428,6 +_,12 @@
+ 
+         @Override
+         public void onRemove(Entity.RemovalReason p_157619_) {
++            synchronized (PersistentEntitySectionManager.this.mcmtStructuralLock) { // MCMT hook H2
++                this.onRemoveLocked(p_157619_);
++            }
++        }
++
++        private void onRemoveLocked(Entity.RemovalReason p_157619_) {
+             if (!this.currentSection.remove(this.entity)) {
+                 PersistentEntitySectionManager.LOGGER
+                     .warn("Entity {} wasn't found in section {} (destroying due to {})", this.entity, SectionPos.of(this.currentSectionKey), p_157619_);

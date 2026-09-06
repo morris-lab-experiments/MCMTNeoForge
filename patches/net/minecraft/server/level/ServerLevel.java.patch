@@ -59,17 +59,33 @@
          if (flag1) {
              this.resetEmptyTime();
          }
-@@ -412,7 +_,9 @@
+@@ -393,6 +_,7 @@
+                 profilerfiller.pop();
+             }
+ 
++            net.neoforged.neoforge.mcmt.TickBatch mcmtBatch = net.neoforged.neoforge.mcmt.MCMT.startEntityTicks(this); // MCMT hook H2
+             this.entityTickList.forEach(p_308566_ -> {
+                 if (!p_308566_.isRemoved()) {
+                     if (this.shouldDiscardEntity(p_308566_)) {
+@@ -412,12 +_,17 @@
                              }
  
                              profilerfiller.push("tick");
 -                            this.guardEntityTick(this::tickNonPassenger, p_308566_);
 +                            if (!p_308566_.isRemoved() && !(p_308566_ instanceof net.neoforged.neoforge.entity.PartEntity)) {
-+                                net.neoforged.neoforge.mcmt.MCMT.callEntityTick(this.mcmtGuardedEntityTick, p_308566_, this); // MCMT hook H2
++                                net.neoforged.neoforge.mcmt.MCMT.callEntityTick(mcmtBatch, this.mcmtGuardedEntityTick, p_308566_, this); // MCMT hook H2
 +                            }
                              profilerfiller.pop();
                          }
                      }
+                 }
+             });
++            // MCMT hook H2: entity ticks finish before block-entity ticks start, so the two never overlap
++            // within a level, and entityManager.tick() below is reached with nothing of ours in flight.
++            net.neoforged.neoforge.mcmt.MCMT.finishEntityTicks(mcmtBatch);
+             profilerfiller.pop();
+             this.tickBlockEntities();
+         }
 @@ -438,7 +_,7 @@
              this.serverLevelData.setGameTime(i);
              this.serverLevelData.getScheduledEvents().tick(this.server, i);

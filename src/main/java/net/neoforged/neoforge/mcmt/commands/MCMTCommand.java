@@ -150,6 +150,7 @@ public final class MCMTCommand {
                 + MCMT.getRunningBlockEntityTicks() + " block entity, "
                 + MCMT.getRunningChunkTicks() + " chunk");
         line(source, "Dispatched", MCMT.getDispatchedLevelTicks() + " level, "
+                + MCMT.getDispatchedEntityTicks() + " entity, "
                 + MCMT.getDispatchedBlockEntityTicks() + " block entity ticks since startup");
         Set<Class<?>> demoted = SerDesRegistry.autoDemoted();
         if (!demoted.isEmpty()) {
