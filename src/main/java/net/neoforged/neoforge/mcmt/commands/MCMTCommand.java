@@ -105,7 +105,7 @@ public final class MCMTCommand {
                     }
                     MCMTConfig.paraMax = parsed;
                 },
-                "0-256, needs /mcmt restart"));
+                "0-256 (below 4 is rounded up), needs /mcmt restart"));
         SETTINGS.put("paraMaxMode", new Setting(
                 () -> MCMTConfig.paraMaxMode.name(),
                 value -> {
