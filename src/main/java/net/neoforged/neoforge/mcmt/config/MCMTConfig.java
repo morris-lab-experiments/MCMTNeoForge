@@ -1,0 +1,317 @@
+/*
+ * Copyright (c) NeoForged and contributors
+ * SPDX-License-Identifier: LGPL-2.1-only
+ */
+
+package net.neoforged.neoforge.mcmt.config;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import net.neoforged.bus.api.SubscribeEvent;
+import net.neoforged.fml.event.config.ModConfigEvent;
+import net.neoforged.neoforge.common.ModConfigSpec;
+import net.neoforged.neoforge.common.ModConfigSpec.BooleanValue;
+import net.neoforged.neoforge.common.ModConfigSpec.ConfigValue;
+import net.neoforged.neoforge.common.ModConfigSpec.EnumValue;
+import net.neoforged.neoforge.common.ModConfigSpec.IntValue;
+import org.apache.commons.lang3.tuple.Pair;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
+/**
+ * Configuration for multi-core tick processing, mirroring JMT-MCMT's {@code GeneralConfig}.
+ *
+ * <p>There are two copies of every setting: the {@link ModConfigSpec} values (the on-disk config, reachable via
+ * {@link #SPEC_VALUES}) and the plain {@code static} fields on this class (the "baked" copy). The tick hooks read
+ * only the baked fields, because they sit on the hottest paths in the game and a {@code ConfigValue.get()} call
+ * per entity per tick is far too expensive. {@link #bake()} copies spec to baked; {@link #save()} copies back.
+ *
+ * <p>Every setting is runtime-toggleable through {@code /mcmt config}, which writes the baked field directly.
+ * Such a change is lost on restart unless {@code /mcmt save} is used to push it back into the config file.
+ *
+ * <p>This is a {@code COMMON} config rather than {@code SERVER}: the worker pool is a JVM-level resource that has
+ * to be sized before any server starts, and these settings are a property of the installation rather than of a
+ * particular world.
+ */
+public final class MCMTConfig {
+    private static final Logger LOGGER = LogManager.getLogger();
+
+    private MCMTConfig() {}
+
+    /** How {@link #paraMax} is interpreted when sizing the worker pool. */
+    public enum ParaMaxMode {
+        /** {@code paraMax} is an upper bound, clamped to the available processor count. */
+        STANDARD,
+        /** {@code paraMax} is used verbatim, even above the available processor count. */
+        OVERRIDE,
+        /** {@code paraMax} is subtracted from the available processor count. */
+        REDUCTION
+    }
+
+    // Baked values. Read by the tick hooks; written by bake() and by /mcmt config.
+    // ---------------------------------------------------------------------------
+
+    /** Master switch. When true every hook runs its task inline on the calling thread, exactly like vanilla. */
+    public static boolean disabled;
+
+    /** Requested worker count, interpreted according to {@link #paraMaxMode}. Zero or one means "all processors". */
+    public static int paraMax;
+
+    /** How {@link #paraMax} is interpreted. */
+    public static ParaMaxMode paraMaxMode;
+
+    /** Disables parallel dispatch of the per-{@code ServerLevel} tick (hook H1). */
+    public static boolean disableWorld;
+
+    /** Disables parallel dispatch of entity ticks (hook H2). */
+    public static boolean disableEntity;
+
+    /** Disables parallel dispatch of block-entity ticks (hook H3). */
+    public static boolean disableBlockEntity;
+
+    /** Disables parallel dispatch of chunk/environment ticks (hook H4). */
+    public static boolean disableEnvironment;
+
+    /** Disables the concurrent chunk-cache fast path (hook H5). */
+    public static boolean disableChunkProvider;
+
+    /** When true, block entities whose class is not part of vanilla are chunk-locked rather than run freely. */
+    public static boolean chunkLockModded;
+
+    /** Block-entity classes that are always chunk-locked. Resolved from {@link Template#blockEntityBlackList}. */
+    public static Set<Class<?>> blockEntityBlackList = ConcurrentHashMap.newKeySet();
+
+    /** Block-entity classes that are never chunk-locked; overrides the blacklist and {@link #chunkLockModded}. */
+    public static Set<Class<?>> blockEntityWhiteList = ConcurrentHashMap.newKeySet();
+
+    /** Entity classes that are always chunk-locked. */
+    public static Set<Class<?>> entityBlackList = ConcurrentHashMap.newKeySet();
+
+    /** Entity classes that are never chunk-locked. */
+    public static Set<Class<?>> entityWhiteList = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Class names from the four lists above that could not be resolved in this environment (a mod is absent, or
+     * the name is a typo). Kept so that {@link #save()} does not silently drop them from the config file.
+     */
+    public static List<String> unresolvedClassNames = new ArrayList<>();
+
+    /**
+     * When true, every dispatched task registers a human-readable name in {@code MCMT.currentTasks} for the
+     * duration of its run, so a crash report can list what was in flight. Costs a string concatenation and two
+     * concurrent-set operations per task, so it is off by default.
+     */
+    public static boolean opsTracing;
+
+    // Spec
+    // ----
+
+    /** The on-disk mirror of the settings above. */
+    public static final class Template {
+        public final BooleanValue disabled;
+        public final IntValue paraMax;
+        public final EnumValue<ParaMaxMode> paraMaxMode;
+        public final BooleanValue disableWorld;
+        public final BooleanValue disableEntity;
+        public final BooleanValue disableBlockEntity;
+        public final BooleanValue disableEnvironment;
+        public final BooleanValue disableChunkProvider;
+        public final BooleanValue chunkLockModded;
+        public final ConfigValue<List<? extends String>> blockEntityBlackList;
+        public final ConfigValue<List<? extends String>> blockEntityWhiteList;
+        public final ConfigValue<List<? extends String>> entityBlackList;
+        public final ConfigValue<List<? extends String>> entityWhiteList;
+        public final BooleanValue opsTracing;
+
+        Template(ModConfigSpec.Builder builder) {
+            builder.comment("Multi-core tick processing (MCMT).",
+                    "Parallelising the server tick trades determinism and stability for throughput.",
+                    "Every value here can also be changed at runtime with /mcmt config <key> <value>.")
+                    .push("general");
+            disabled = builder
+                    .comment("Master switch. When true, MCMT runs every tick inline on the server thread (vanilla behaviour).")
+                    .define("disabled", true);
+            opsTracing = builder
+                    .comment("Record the name of every in-flight parallel task so crash reports can list them.",
+                            "Useful when hunting a concurrency crash, but it costs allocation on every task.")
+                    .define("opsTracing", false);
+            builder.pop();
+
+            builder.comment("Worker pool sizing.").push("parallelism");
+            paraMaxMode = builder
+                    .comment("How paraMax is interpreted:",
+                            "STANDARD  - paraMax is an upper bound, clamped to the processor count.",
+                            "OVERRIDE  - paraMax is used verbatim, even above the processor count.",
+                            "REDUCTION - paraMax is subtracted from the processor count. Use this to leave headroom",
+                            "            for Minecraft's own background executor, which handles chunk generation and I/O.")
+                    .defineEnum("paraMaxMode", ParaMaxMode.STANDARD);
+            paraMax = builder
+                    .comment("Requested worker count. 0 or 1 means 'use all available processors'.")
+                    .defineInRange("paraMax", 0, 0, 256);
+            builder.pop();
+
+            builder.comment("Per-hook switches. Each disables parallel dispatch for one tick loop,",
+                    "running it inline instead. Useful for bisecting which loop is causing trouble.")
+                    .push("hooks");
+            disableWorld = builder
+                    .comment("Disable parallel dispatch of per-level ticks (MinecraftServer.tickChildren).")
+                    .define("disableWorld", false);
+            disableEntity = builder
+                    .comment("Disable parallel dispatch of entity ticks (ServerLevel.tick).")
+                    .define("disableEntity", false);
+            disableBlockEntity = builder
+                    .comment("Disable parallel dispatch of block-entity ticks (Level.tickBlockEntities).")
+                    .define("disableBlockEntity", false);
+            disableEnvironment = builder
+                    .comment("Disable parallel dispatch of chunk/environment ticks (ServerChunkCache.tickChunks).")
+                    .define("disableEnvironment", false);
+            disableChunkProvider = builder
+                    .comment("Disable the concurrent chunk-cache fast path (ServerChunkCache.getChunk).")
+                    .define("disableChunkProvider", false);
+            builder.pop();
+
+            builder.comment("Which entity and block-entity classes may not run freely in parallel.",
+                    "Blacklisted classes are chunk-locked: their tick takes a lock on the chunks around them,",
+                    "so two of them near each other are serialised while distant ones still run concurrently.",
+                    "The whitelist wins over both the blacklist and chunkLockModded.",
+                    "Entries are fully-qualified class names. Unknown names are kept but ignored.")
+                    .push("serdes");
+            chunkLockModded = builder
+                    .comment("Chunk-lock every block entity and entity whose class is not part of vanilla Minecraft.",
+                            "This is the safe default: modded tick code has never been audited for thread safety.")
+                    .define("chunkLockModded", true);
+            blockEntityBlackList = builder.defineList("blockEntityBlackList", List.of(), o -> o instanceof String);
+            blockEntityWhiteList = builder.defineList("blockEntityWhiteList", List.of(), o -> o instanceof String);
+            entityBlackList = builder.defineList("entityBlackList", List.of(), o -> o instanceof String);
+            entityWhiteList = builder.defineList("entityWhiteList", List.of(), o -> o instanceof String);
+            builder.pop();
+        }
+    }
+
+    /** The on-disk config values. Prefer the baked static fields when reading from a tick hook. */
+    public static final Template SPEC_VALUES;
+
+    /** The spec to register with the mod container. */
+    public static final ModConfigSpec SPEC;
+
+    static {
+        final Pair<Template, ModConfigSpec> pair = new ModConfigSpec.Builder().configure(Template::new);
+        SPEC_VALUES = pair.getLeft();
+        SPEC = pair.getRight();
+    }
+
+    // Pool sizing
+    // -----------
+
+    /** The worker count implied by {@link #paraMax} and {@link #paraMaxMode}. Never less than two. */
+    public static int getParallelism() {
+        int cores = Runtime.getRuntime().availableProcessors();
+        return switch (paraMaxMode) {
+            case STANDARD -> paraMax <= 1 ? cores : Math.max(2, Math.min(cores, paraMax));
+            case OVERRIDE -> paraMax <= 1 ? cores : Math.max(2, paraMax);
+            case REDUCTION -> Math.max(2, cores - Math.max(0, paraMax));
+        };
+    }
+
+    // Bake / save
+    // -----------
+
+    @SubscribeEvent
+    public static void onConfigLoad(final ModConfigEvent.Loading event) {
+        if (event.getConfig().getSpec() == SPEC) {
+            bake();
+        }
+    }
+
+    @SubscribeEvent
+    public static void onConfigReload(final ModConfigEvent.Reloading event) {
+        if (event.getConfig().getSpec() == SPEC) {
+            bake();
+        }
+    }
+
+    /** Copies the on-disk config into the baked fields the tick hooks read. */
+    public static synchronized void bake() {
+        disabled = SPEC_VALUES.disabled.get();
+        opsTracing = SPEC_VALUES.opsTracing.get();
+
+        paraMax = SPEC_VALUES.paraMax.get();
+        paraMaxMode = SPEC_VALUES.paraMaxMode.get();
+
+        disableWorld = SPEC_VALUES.disableWorld.get();
+        disableEntity = SPEC_VALUES.disableEntity.get();
+        disableBlockEntity = SPEC_VALUES.disableBlockEntity.get();
+        disableEnvironment = SPEC_VALUES.disableEnvironment.get();
+        disableChunkProvider = SPEC_VALUES.disableChunkProvider.get();
+
+        chunkLockModded = SPEC_VALUES.chunkLockModded.get();
+
+        List<String> unresolved = new ArrayList<>();
+        blockEntityBlackList = resolve(SPEC_VALUES.blockEntityBlackList.get(), unresolved);
+        blockEntityWhiteList = resolve(SPEC_VALUES.blockEntityWhiteList.get(), unresolved);
+        entityBlackList = resolve(SPEC_VALUES.entityBlackList.get(), unresolved);
+        entityWhiteList = resolve(SPEC_VALUES.entityWhiteList.get(), unresolved);
+        unresolvedClassNames = unresolved;
+    }
+
+    /** Copies the baked fields back into the on-disk config and writes it out. */
+    public static synchronized void save() {
+        SPEC_VALUES.disabled.set(disabled);
+        SPEC_VALUES.opsTracing.set(opsTracing);
+
+        SPEC_VALUES.paraMax.set(paraMax);
+        SPEC_VALUES.paraMaxMode.set(paraMaxMode);
+
+        SPEC_VALUES.disableWorld.set(disableWorld);
+        SPEC_VALUES.disableEntity.set(disableEntity);
+        SPEC_VALUES.disableBlockEntity.set(disableBlockEntity);
+        SPEC_VALUES.disableEnvironment.set(disableEnvironment);
+        SPEC_VALUES.disableChunkProvider.set(disableChunkProvider);
+
+        SPEC_VALUES.chunkLockModded.set(chunkLockModded);
+
+        SPEC_VALUES.blockEntityBlackList.set(names(blockEntityBlackList, SPEC_VALUES.blockEntityBlackList.get()));
+        SPEC_VALUES.blockEntityWhiteList.set(names(blockEntityWhiteList, SPEC_VALUES.blockEntityWhiteList.get()));
+        SPEC_VALUES.entityBlackList.set(names(entityBlackList, SPEC_VALUES.entityBlackList.get()));
+        SPEC_VALUES.entityWhiteList.set(names(entityWhiteList, SPEC_VALUES.entityWhiteList.get()));
+
+        SPEC.save();
+    }
+
+    /**
+     * Turns configured class names into classes. Names that do not resolve in this environment are collected into
+     * {@code unresolved} rather than dropped, so a config shared between a modded and a vanilla instance survives
+     * a round trip through {@link #save()}.
+     */
+    private static Set<Class<?>> resolve(List<? extends String> classNames, List<String> unresolved) {
+        Set<Class<?>> resolved = ConcurrentHashMap.newKeySet();
+        for (String name : classNames) {
+            try {
+                resolved.add(Class.forName(name, false, MCMTConfig.class.getClassLoader()));
+            } catch (ClassNotFoundException | LinkageError e) {
+                LOGGER.debug("MCMT: config lists class {}, which is not present in this environment", name);
+                unresolved.add(name);
+            }
+        }
+        return resolved;
+    }
+
+    /**
+     * Renders a baked class set back to names, re-adding whichever of the previously configured names failed to
+     * resolve. {@code previous} is the list as it stands on disk.
+     */
+    private static List<String> names(Set<Class<?>> classes, List<? extends String> previous) {
+        List<String> out = new ArrayList<>(classes.size());
+        for (Class<?> c : classes) {
+            out.add(c.getName());
+        }
+        for (String name : previous) {
+            if (unresolvedClassNames.contains(name)) {
+                out.add(name);
+            }
+        }
+        return out;
+    }
+}

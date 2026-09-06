@@ -144,9 +144,11 @@
          );
      }
  
-@@ -996,7 +_,8 @@
+@@ -995,8 +_,10 @@
+         this.profiler.push("commandFunctions");
          this.getFunctions().tick();
          this.profiler.popPush("levels");
++        net.neoforged.neoforge.mcmt.MCMT.preTick(this); // MCMT hook H1: opens the parallel tick barrier
  
 -        for (ServerLevel serverlevel : this.getAllLevels()) {
 +        for(ServerLevel serverlevel : this.getWorldArray()) {
@@ -154,15 +156,17 @@
              this.profiler.push(() -> serverlevel + " " + serverlevel.dimension().location());
              if (this.tickCount % 20 == 0) {
                  this.profiler.push("timeSync");
-@@ -1005,6 +_,7 @@
+@@ -1005,24 +_,28 @@
              }
  
              this.profiler.push("tick");
 +            net.neoforged.neoforge.event.EventHooks.fireLevelTickPre(serverlevel, p_129954_);
  
              try {
-                 serverlevel.tick(p_129954_);
-@@ -1013,16 +_,18 @@
+-                serverlevel.tick(p_129954_);
++                net.neoforged.neoforge.mcmt.MCMT.callTick(serverlevel, p_129954_, this); // MCMT hook H1
+             } catch (Throwable throwable) {
+                 CrashReport crashreport = CrashReport.forThrowable(throwable, "Exception ticking world");
                  serverlevel.fillReportDetails(crashreport);
                  throw new ReportedException(crashreport);
              }
@@ -173,6 +177,7 @@
 +            perWorldTickTimes.computeIfAbsent(serverlevel.dimension(), k -> new long[100])[this.tickCount % 100] = Util.getNanos() - tickStart;
          }
  
++        net.neoforged.neoforge.mcmt.MCMT.postTick(this); // MCMT hook H1: waits for every dispatched level tick
          this.profiler.popPush("connection");
          this.getConnection().tick();
          this.profiler.popPush("players");

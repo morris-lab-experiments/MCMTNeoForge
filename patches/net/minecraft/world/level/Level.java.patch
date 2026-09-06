@@ -114,6 +114,15 @@
          if (!this.pendingBlockEntityTickers.isEmpty()) {
              this.blockEntityTickers.addAll(this.pendingBlockEntityTickers);
              this.pendingBlockEntityTickers.clear();
+@@ -506,7 +_,7 @@
+             if (tickingblockentity.isRemoved()) {
+                 iterator.remove();
+             } else if (flag && this.shouldTickBlocksAt(tickingblockentity.getPos())) {
+-                tickingblockentity.tick();
++                net.neoforged.neoforge.mcmt.MCMT.callBlockEntityTick(tickingblockentity, this); // MCMT hook H3
+             }
+         }
+ 
 @@ -516,12 +_,19 @@
  
      public <T extends Entity> void guardEntityTick(Consumer<T> p_46654_, T p_46655_) {

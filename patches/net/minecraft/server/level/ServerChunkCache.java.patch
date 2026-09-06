@@ -19,7 +19,7 @@
                  ChunkAccess chunkaccess1 = chunkholder.getChunkIfPresent(ChunkStatus.FULL);
                  if (chunkaccess1 != null) {
                      this.storeInCache(i, chunkaccess1, ChunkStatus.FULL);
-@@ -356,7 +_,7 @@
+@@ -356,14 +_,14 @@
                  for (ServerChunkCache.ChunkAndHolder serverchunkcache$chunkandholder : list) {
                      LevelChunk levelchunk1 = serverchunkcache$chunkandholder.chunk;
                      ChunkPos chunkpos = levelchunk1.getPos();
@@ -28,6 +28,14 @@
                          levelchunk1.incrementInhabitedTime(j);
                          if (flag1 && (this.spawnEnemies || this.spawnFriendlies) && this.level.getWorldBorder().isWithinBounds(chunkpos)) {
                              NaturalSpawner.spawnForChunk(this.level, levelchunk1, naturalspawner$spawnstate, this.spawnFriendlies, this.spawnEnemies, flag);
+                         }
+ 
+                         if (this.level.shouldTickBlocksAt(chunkpos.toLong())) {
+-                            this.level.tickChunk(levelchunk1, k);
++                            net.neoforged.neoforge.mcmt.MCMT.callTickChunk(this.level, levelchunk1, k); // MCMT hook H4
+                         }
+                     }
+                 }
 @@ -435,11 +_,17 @@
      }
  

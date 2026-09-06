@@ -569,6 +569,7 @@ public class NeoForgeMod {
         container.registerConfig(ModConfig.Type.SERVER, NeoForgeConfig.serverSpec);
         container.registerConfig(ModConfig.Type.COMMON, NeoForgeConfig.commonSpec);
         modEventBus.register(NeoForgeConfig.class);
+        net.neoforged.neoforge.mcmt.MCMTBootstrap.init(container, modEventBus);
         NeoForgeRegistriesSetup.setup(modEventBus);
         StartupNotificationManager.addModMessage("NeoForge version " + NeoForgeVersion.getVersion());
 

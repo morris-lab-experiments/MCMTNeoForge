@@ -1,5 +1,17 @@
 --- a/net/minecraft/server/level/ServerLevel.java
 +++ b/net/minecraft/server/level/ServerLevel.java
+@@ -181,6 +_,11 @@
+     private final ServerLevelData serverLevelData;
+     private int lastSpawnChunkRadius;
+     final EntityTickList entityTickList = new EntityTickList();
++    // MCMT hook H2: cached so the per-entity dispatch in tick() allocates nothing. Two fields rather than one
++    // because a `e -> this.guardEntityTick(this::tickNonPassenger, e)` lambda would allocate the inner method
++    // reference on every call.
++    private final java.util.function.Consumer<Entity> mcmtTickNonPassenger = this::tickNonPassenger;
++    private final java.util.function.Consumer<Entity> mcmtGuardedEntityTick = p_mcmt_ -> this.guardEntityTick(this.mcmtTickNonPassenger, p_mcmt_);
+     private final PersistentEntitySectionManager<Entity> entityManager;
+     private final GameEventDispatcher gameEventDispatcher;
+     public boolean noSave;
 @@ -199,7 +_,7 @@
      private final List<CustomSpawner> customSpawners;
      @Nullable
@@ -53,7 +65,7 @@
                              profilerfiller.push("tick");
 -                            this.guardEntityTick(this::tickNonPassenger, p_308566_);
 +                            if (!p_308566_.isRemoved() && !(p_308566_ instanceof net.neoforged.neoforge.entity.PartEntity)) {
-+                                this.guardEntityTick(this::tickNonPassenger, p_308566_);
++                                net.neoforged.neoforge.mcmt.MCMT.callEntityTick(this.mcmtGuardedEntityTick, p_308566_, this); // MCMT hook H2
 +                            }
                              profilerfiller.pop();
                          }
