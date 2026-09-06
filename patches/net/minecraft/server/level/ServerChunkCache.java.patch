@@ -1,6 +1,27 @@
 --- a/net/minecraft/server/level/ServerChunkCache.java
 +++ b/net/minecraft/server/level/ServerChunkCache.java
-@@ -110,6 +_,24 @@
+@@ -58,9 +_,17 @@
+     private boolean spawnEnemies = true;
+     private boolean spawnFriendlies = true;
+     private static final int CACHE_SIZE = 4;
+-    private final long[] lastChunkPos = new long[4];
+-    private final ChunkStatus[] lastChunkStatus = new ChunkStatus[4];
+-    private final ChunkAccess[] lastChunk = new ChunkAccess[4];
++    // MCMT hook: the recently-used chunk cache. Vanilla keeps three parallel arrays here; folding each slot
++    // into one immutable ChunkCacheEntry makes a slot read atomic, so a worker can never match a position
++    // whose chunk has already been replaced and come away with the wrong chunk. See ChunkCacheEntry.
++    private final java.util.concurrent.atomic.AtomicReferenceArray<net.neoforged.neoforge.mcmt.parallel.ChunkCacheEntry> lastChunks = new java.util.concurrent.atomic.AtomicReferenceArray<>(
++        4
++    );
++
++    // MCMT hook: guards the cache-miss path below. getChunkFutureMainThread walks ChunkMap and DistanceManager,
++    // neither of which tolerates concurrent callers, so only one thread at a time may load a chunk into this
++    // level. That is no worse than vanilla, where all chunk loading happens on the server thread anyway.
++    private final java.util.concurrent.locks.ReentrantLock mcmtChunkLoadLock = new java.util.concurrent.locks.ReentrantLock();
+     @Nullable
+     @VisibleForDebug
+     private NaturalSpawner.SpawnState lastSpawnState;
+@@ -110,6 +_,23 @@
          return this.lightEngine;
      }
  
@@ -13,10 +34,9 @@
 +     * worker taking the off-thread branch deadlocks. The main-thread branch instead drains the queue itself via
 +     * {@code managedBlock}, which is what a worker needs.
 +     *
-+     * <p>This is only sound while at most one thread drives a given chunk source at a time — true today,
-+     * because each {@code ServerLevel} has its own and a level's tick runs on a single worker. Parallelising
-+     * ticks <em>within</em> a level makes the {@code lastChunk} cache and {@code getChunkFutureMainThread}
-+     * genuinely concurrent, which is what the concurrent-chunk-cache phase is for.
++     * <p>Several workers may hold this at once, so the paths they take have to tolerate it: the recently-used
++     * cache is an atomic array of immutable entries, and the cache-miss path is serialised by
++     * {@link #mcmtChunkLoadLock}.
 +     */
 +    private boolean mcmtCanDriveDirectly() {
 +        return Thread.currentThread() == this.mainThread || net.neoforged.neoforge.mcmt.MCMT.isPoolThread();
@@ -25,7 +45,22 @@
      @Nullable
      private ChunkHolder getVisibleChunkIfPresent(long p_8365_) {
          return this.chunkMap.getVisibleChunkIfPresent(p_8365_);
-@@ -134,7 +_,7 @@
+@@ -121,20 +_,16 @@
+ 
+     private void storeInCache(long p_8367_, @Nullable ChunkAccess p_8368_, ChunkStatus p_331839_) {
+         for (int i = 3; i > 0; i--) {
+-            this.lastChunkPos[i] = this.lastChunkPos[i - 1];
+-            this.lastChunkStatus[i] = this.lastChunkStatus[i - 1];
+-            this.lastChunk[i] = this.lastChunk[i - 1];
++            this.lastChunks.set(i, this.lastChunks.get(i - 1));
+         }
+ 
+-        this.lastChunkPos[0] = p_8367_;
+-        this.lastChunkStatus[0] = p_331839_;
+-        this.lastChunk[0] = p_8368_;
++        this.lastChunks.set(0, new net.neoforged.neoforge.mcmt.parallel.ChunkCacheEntry(p_8367_, p_331839_, p_8368_));
+     }
+ 
      @Nullable
      @Override
      public ChunkAccess getChunk(int p_8360_, int p_8361_, ChunkStatus p_330876_, boolean p_8363_) {
@@ -34,7 +69,18 @@
              return CompletableFuture.<ChunkAccess>supplyAsync(() -> this.getChunk(p_8360_, p_8361_, p_330876_, p_8363_), this.mainThreadProcessor).join();
          } else {
              ProfilerFiller profilerfiller = this.level.getProfiler();
-@@ -150,6 +_,10 @@
+@@ -142,24 +_,48 @@
+             long i = ChunkPos.asLong(p_8360_, p_8361_);
+ 
+             for (int j = 0; j < 4; j++) {
+-                if (i == this.lastChunkPos[j] && p_330876_ == this.lastChunkStatus[j]) {
+-                    ChunkAccess chunkaccess = this.lastChunk[j];
++                net.neoforged.neoforge.mcmt.parallel.ChunkCacheEntry entry = this.lastChunks.get(j);
++                if (entry != null && entry.matches(i, p_330876_)) {
++                    ChunkAccess chunkaccess = entry.chunk();
+                     if (chunkaccess != null || !p_8363_) {
+                         return chunkaccess;
+                     }
                  }
              }
  
@@ -43,9 +89,47 @@
 +                return chunkholder.currentlyLoading; // Neo: If the requested chunk is loading, bypass the future chain to prevent a deadlock.
 +
              profilerfiller.incrementCounter("getChunkCacheMiss");
-             CompletableFuture<ChunkResult<ChunkAccess>> completablefuture = this.getChunkFutureMainThread(p_8360_, p_8361_, p_330876_, p_8363_);
-             this.mainThreadProcessor.managedBlock(completablefuture::isDone);
-@@ -167,7 +_,7 @@
+-            CompletableFuture<ChunkResult<ChunkAccess>> completablefuture = this.getChunkFutureMainThread(p_8360_, p_8361_, p_330876_, p_8363_);
+-            this.mainThreadProcessor.managedBlock(completablefuture::isDone);
+-            ChunkResult<ChunkAccess> chunkresult = completablefuture.join();
+-            ChunkAccess chunkaccess1 = chunkresult.orElse(null);
+-            if (chunkaccess1 == null && p_8363_) {
+-                throw (IllegalStateException)Util.pauseInIde(new IllegalStateException("Chunk not there when requested: " + chunkresult.getError()));
+-            } else {
+-                this.storeInCache(i, chunkaccess1, p_330876_);
+-                return chunkaccess1;
++            // MCMT hook: one loader at a time per level, and entered through a ManagedBlocker so a worker
++            // waiting here hands its slot back to the pool instead of starving it.
++            net.neoforged.neoforge.mcmt.parallel.RunnableManagedBlocker.runManaged(this.mcmtChunkLoadLock::lock);
++
++            try {
++                // Another thread may have loaded it while we waited for the lock.
++                for (int j = 0; j < 4; j++) {
++                    net.neoforged.neoforge.mcmt.parallel.ChunkCacheEntry entry = this.lastChunks.get(j);
++                    if (entry != null && entry.matches(i, p_330876_)) {
++                        ChunkAccess cached = entry.chunk();
++                        if (cached != null || !p_8363_) {
++                            return cached;
++                        }
++                    }
++                }
++
++                CompletableFuture<ChunkResult<ChunkAccess>> completablefuture = this.getChunkFutureMainThread(p_8360_, p_8361_, p_330876_, p_8363_);
++                this.mainThreadProcessor.managedBlock(completablefuture::isDone);
++                ChunkResult<ChunkAccess> chunkresult = completablefuture.join();
++                ChunkAccess chunkaccess1 = chunkresult.orElse(null);
++                if (chunkaccess1 == null && p_8363_) {
++                    throw (IllegalStateException)Util.pauseInIde(new IllegalStateException("Chunk not there when requested: " + chunkresult.getError()));
++                } else {
++                    this.storeInCache(i, chunkaccess1, p_330876_);
++                    return chunkaccess1;
++                }
++            } finally {
++                this.mcmtChunkLoadLock.unlock();
+             }
+         }
+     }
+@@ -167,15 +_,16 @@
      @Nullable
      @Override
      public LevelChunk getChunkNow(int p_8357_, int p_8358_) {
@@ -54,6 +138,17 @@
              return null;
          } else {
              this.level.getProfiler().incrementCounter("getChunkNow");
+             long i = ChunkPos.asLong(p_8357_, p_8358_);
+ 
+             for (int j = 0; j < 4; j++) {
+-                if (i == this.lastChunkPos[j] && this.lastChunkStatus[j] == ChunkStatus.FULL) {
+-                    ChunkAccess chunkaccess = this.lastChunk[j];
++                net.neoforged.neoforge.mcmt.parallel.ChunkCacheEntry entry = this.lastChunks.get(j);
++                if (entry != null && entry.matches(i, ChunkStatus.FULL)) {
++                    ChunkAccess chunkaccess = entry.chunk();
+                     return chunkaccess instanceof LevelChunk ? (LevelChunk)chunkaccess : null;
+                 }
+             }
 @@ -184,6 +_,7 @@
              if (chunkholder == null) {
                  return null;
@@ -62,7 +157,16 @@
                  ChunkAccess chunkaccess1 = chunkholder.getChunkIfPresent(ChunkStatus.FULL);
                  if (chunkaccess1 != null) {
                      this.storeInCache(i, chunkaccess1, ChunkStatus.FULL);
-@@ -204,7 +_,7 @@
+@@ -198,13 +_,13 @@
+     }
+ 
+     private void clearCache() {
+-        Arrays.fill(this.lastChunkPos, ChunkPos.INVALID_CHUNK_POS);
+-        Arrays.fill(this.lastChunkStatus, null);
+-        Arrays.fill(this.lastChunk, null);
++        for (int i = 0; i < 4; i++) {
++            this.lastChunks.set(i, null);
++        }
      }
  
      public CompletableFuture<ChunkResult<ChunkAccess>> getChunkFuture(int p_8432_, int p_8433_, ChunkStatus p_330326_, boolean p_8435_) {

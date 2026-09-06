@@ -254,6 +254,9 @@ public final class MCMTConfig {
         entityBlackList = resolve(SPEC_VALUES.entityBlackList.get(), unresolved);
         entityWhiteList = resolve(SPEC_VALUES.entityWhiteList.get(), unresolved);
         unresolvedClassNames = unresolved;
+
+        // Filters read the lists and chunkLockModded above, and their answers are cached per class.
+        net.neoforged.neoforge.mcmt.serdes.SerDesRegistry.invalidate();
     }
 
     /** Copies the baked fields back into the on-disk config and writes it out. */

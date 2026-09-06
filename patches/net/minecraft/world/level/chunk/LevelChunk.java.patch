@@ -122,7 +122,18 @@
      class BoundTickingBlockEntity<T extends BlockEntity> implements TickingBlockEntity {
          private final T blockEntity;
          private final BlockEntityTicker<T> ticker;
-@@ -679,6 +_,7 @@
+@@ -673,12 +_,18 @@
+         }
+ 
+         @Override
++        public Class<?> mcmtTickedType() { // MCMT hook H3
++            return this.blockEntity.getClass();
++        }
++
++        @Override
+         public void tick() {
+             if (!this.blockEntity.isRemoved() && this.blockEntity.hasLevel()) {
+                 BlockPos blockpos = this.blockEntity.getBlockPos();
                  if (LevelChunk.this.isTicking(blockpos)) {
                      try {
                          ProfilerFiller profilerfiller = LevelChunk.this.level.getProfiler();
@@ -146,3 +157,15 @@
                      }
                  }
              }
+@@ -747,6 +_,11 @@
+ 
+         void rebind(TickingBlockEntity p_156450_) {
+             this.ticker = p_156450_;
++        }
++
++        @Override
++        public Class<?> mcmtTickedType() { // MCMT hook H3: see through the wrapping to the real block entity
++            return this.ticker.mcmtTickedType();
+         }
+ 
+         @Override

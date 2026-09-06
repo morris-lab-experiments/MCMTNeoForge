@@ -14,6 +14,7 @@ import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
@@ -25,6 +26,7 @@ import net.minecraft.network.chat.Component;
 import net.neoforged.neoforge.mcmt.MCMT;
 import net.neoforged.neoforge.mcmt.config.MCMTConfig;
 import net.neoforged.neoforge.mcmt.parallel.MCMTThreadPool;
+import net.neoforged.neoforge.mcmt.serdes.SerDesRegistry;
 import org.jetbrains.annotations.ApiStatus;
 
 /**
@@ -147,7 +149,15 @@ public final class MCMTCommand {
                 + MCMT.getRunningEntityTicks() + " entity, "
                 + MCMT.getRunningBlockEntityTicks() + " block entity, "
                 + MCMT.getRunningChunkTicks() + " chunk");
-        line(source, "Dispatched", MCMT.getDispatchedLevelTicks() + " level ticks since startup");
+        line(source, "Dispatched", MCMT.getDispatchedLevelTicks() + " level, "
+                + MCMT.getDispatchedBlockEntityTicks() + " block entity ticks since startup");
+        Set<Class<?>> demoted = SerDesRegistry.autoDemoted();
+        if (!demoted.isEmpty()) {
+            line(source, "Auto-demoted", demoted.size() + " class(es) chunk-locked after throwing");
+            for (Class<?> type : demoted) {
+                line(source, "  ", type.getName());
+            }
+        }
         if (MCMTConfig.opsTracing) {
             line(source, "Traced tasks", Integer.toString(MCMT.getCurrentTasks().size()));
         }
@@ -228,8 +238,15 @@ public final class MCMTCommand {
     }
 
     private static int save(CommandContext<CommandSourceStack> ctx) {
+        // Fold in whatever AutoFilter learnt this session, so a class that had to be demoted stays demoted
+        // across a restart. Doing it here rather than at demotion time keeps MCMT from editing the owner's
+        // config file without being asked.
+        int learnt = SerDesRegistry.persistAutoDemotions();
         MCMTConfig.save();
-        ctx.getSource().sendSuccess(() -> Component.literal("MCMT configuration written to disk."), true);
+        ctx.getSource().sendSuccess(
+                () -> Component.literal("MCMT configuration written to disk"
+                        + (learnt > 0 ? ", including " + learnt + " auto-demoted class(es)." : ".")),
+                true);
         return 1;
     }
 

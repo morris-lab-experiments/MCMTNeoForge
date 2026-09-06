@@ -9,6 +9,23 @@
      public static final Codec<ResourceKey<Level>> RESOURCE_KEY_CODEC = ResourceKey.codec(Registries.DIMENSION);
      public static final ResourceKey<Level> OVERWORLD = ResourceKey.create(Registries.DIMENSION, ResourceLocation.withDefaultNamespace("overworld"));
      public static final ResourceKey<Level> NETHER = ResourceKey.create(Registries.DIMENSION, ResourceLocation.withDefaultNamespace("the_nether"));
+@@ -90,8 +_,14 @@
+     public static final int MIN_ENTITY_SPAWN_Y = -20000000;
+     protected final List<TickingBlockEntity> blockEntityTickers = Lists.newArrayList();
+     protected final NeighborUpdater neighborUpdater;
+-    private final List<TickingBlockEntity> pendingBlockEntityTickers = Lists.newArrayList();
+-    private boolean tickingBlockEntities;
++    // MCMT hook H3: block entities ticking on workers can add tickers and fresh block entities (a hopper
++    // placing a block, a spawner spawning). Those adds land in the pending collections below while the
++    // dispatch loop is running, so they must tolerate concurrent writers. They are only ever drained on the
++    // level's own tick thread, with no dispatch in flight, so weakly-consistent iteration is fine.
++    private final java.util.Queue<TickingBlockEntity> pendingBlockEntityTickers = new java.util.concurrent.ConcurrentLinkedQueue<>();
++    // Volatile because a worker reads it to decide whether to add to the pending queue or straight to
++    // blockEntityTickers, which the dispatch loop is iterating at the time.
++    private volatile boolean tickingBlockEntities;
+     private final Thread thread;
+     private final boolean isDebug;
+     private int skyDarken;
 @@ -114,6 +_,11 @@
      private final RegistryAccess registryAccess;
      private final DamageSources damageSources;
@@ -17,7 +34,7 @@
 +    public boolean captureBlockSnapshots = false;
 +    public java.util.ArrayList<net.neoforged.neoforge.common.util.BlockSnapshot> capturedBlockSnapshots = new java.util.ArrayList<>();
 +    private final java.util.ArrayList<BlockEntity> freshBlockEntities = new java.util.ArrayList<>();
-+    private final java.util.ArrayList<BlockEntity> pendingFreshBlockEntities = new java.util.ArrayList<>();
++    private final java.util.Queue<BlockEntity> pendingFreshBlockEntities = new java.util.concurrent.ConcurrentLinkedQueue<>(); // MCMT hook H3: see pendingBlockEntityTickers
  
      protected Level(
          WritableLevelData p_270739_,
@@ -114,16 +131,28 @@
          if (!this.pendingBlockEntityTickers.isEmpty()) {
              this.blockEntityTickers.addAll(this.pendingBlockEntityTickers);
              this.pendingBlockEntityTickers.clear();
-@@ -506,7 +_,7 @@
+@@ -500,28 +_,39 @@
+ 
+         Iterator<TickingBlockEntity> iterator = this.blockEntityTickers.iterator();
+         boolean flag = this.tickRateManager().runsNormally();
++        net.neoforged.neoforge.mcmt.TickBatch mcmtBatch = net.neoforged.neoforge.mcmt.MCMT.startBlockEntityTicks(this); // MCMT hook H3
+ 
+         while (iterator.hasNext()) {
+             TickingBlockEntity tickingblockentity = iterator.next();
              if (tickingblockentity.isRemoved()) {
                  iterator.remove();
              } else if (flag && this.shouldTickBlocksAt(tickingblockentity.getPos())) {
 -                tickingblockentity.tick();
-+                net.neoforged.neoforge.mcmt.MCMT.callBlockEntityTick(tickingblockentity, this); // MCMT hook H3
++                net.neoforged.neoforge.mcmt.MCMT.callBlockEntityTick(mcmtBatch, tickingblockentity, this); // MCMT hook H3
              }
          }
  
-@@ -516,12 +_,19 @@
++        // MCMT hook H3: every block entity of this level must have finished before the flag drops, because
++        // clearing it lets concurrent adds go straight into blockEntityTickers instead of the pending queue.
++        net.neoforged.neoforge.mcmt.MCMT.finishBlockEntityTicks(mcmtBatch);
+         this.tickingBlockEntities = false;
+         profilerfiller.pop();
+     }
  
      public <T extends Entity> void guardEntityTick(Consumer<T> p_46654_, T p_46655_) {
          try {
@@ -160,6 +189,23 @@
          explosion.explode();
          explosion.finalizeExplosion(p_312145_);
          return explosion;
+@@ -708,7 +_,15 @@
+         if (this.isOutsideBuildHeight(p_46716_)) {
+             return null;
+         } else {
+-            return !this.isClientSide && Thread.currentThread() != this.thread
++            // MCMT hook H5: a tick worker counts as the level's thread here.
++            //
++            // Vanilla refuses this lookup off-thread because IMMEDIATE creation is not thread-safe, and it
++            // refuses it by returning null rather than throwing. Under MCMT that is the worst possible
++            // answer: a worker running the level's own tick would see every block entity as absent, so
++            // hoppers move nothing, comparators read empty containers and crafters never craft — silently,
++            // with no error anywhere. Accepting pool threads restores the lookup for exactly the threads that
++            // are standing in for the server thread.
++            return !this.isClientSide && Thread.currentThread() != this.thread && !net.neoforged.neoforge.mcmt.MCMT.isPoolThread()
+                 ? null
+                 : this.getChunkAt(p_46716_).getBlockEntity(p_46716_, LevelChunk.EntityCreationType.IMMEDIATE);
+         }
 @@ -725,6 +_,7 @@
          if (!this.isOutsideBuildHeight(p_46748_)) {
              this.getChunkAt(p_46748_).removeBlockEntity(p_46748_);

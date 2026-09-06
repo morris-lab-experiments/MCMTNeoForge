@@ -28,6 +28,9 @@ import net.minecraft.world.level.chunk.LevelChunk;
 import net.neoforged.neoforge.event.EventHooks;
 import net.neoforged.neoforge.mcmt.config.MCMTConfig;
 import net.neoforged.neoforge.mcmt.parallel.MCMTThreadPool;
+import net.neoforged.neoforge.mcmt.serdes.SerDesHookType;
+import net.neoforged.neoforge.mcmt.serdes.SerDesRegistry;
+import net.neoforged.neoforge.mcmt.serdes.pools.SerDesPool;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -49,8 +52,9 @@ import org.apache.logging.log4j.Logger;
  * <li>{@link #callTickChunk} dispatches one chunk/environment tick, from {@code ServerChunkCache.tickChunks}.
  * </ol>
  *
- * <p><b>Current state: only {@link #callTick} dispatches to the pool.</b> The entity, block-entity and chunk
- * hooks are wired but still run inline on the calling thread; they are switched over one phase at a time.
+ * <p><b>Current state: {@link #callTick} and {@link #callBlockEntityTick} dispatch to the pool.</b> The entity
+ * and chunk hooks are wired but still run inline on the calling thread; they are switched over one phase at a
+ * time.
  *
  * <h2>The barrier</h2>
  *
@@ -87,6 +91,9 @@ public final class MCMT {
      * tick timings. The other hooks get their own as they are switched over.
      */
     private static final AtomicLong dispatchedLevelTicks = new AtomicLong();
+
+    /** As {@link #dispatchedLevelTicks}, for block entities. */
+    private static final AtomicLong dispatchedBlockEntityTicks = new AtomicLong();
 
     /**
      * Names of the tasks currently in flight, populated only while {@link MCMTConfig#opsTracing} is on. Read by
@@ -227,6 +234,10 @@ public final class MCMT {
                 recordLevelTickTime(dispatch.level, dispatch.nanos);
             }
             dispatchedLevels.clear();
+
+            // Ticks that could not run concurrently with anything were deferred to here, where the server
+            // thread is the only thing running. See PostExecutePool.
+            SerDesRegistry.postExecutePool().drain();
         }
 
         ticking.set(false);
@@ -337,20 +348,79 @@ public final class MCMT {
         }
     }
 
-    /** Hook H3. Ticks one block entity; from {@code Level.tickBlockEntities}. */
-    public static void callBlockEntityTick(TickingBlockEntity blockEntity, Level level) {
-        if (MCMTConfig.disabled || MCMTConfig.disableBlockEntity || !(level instanceof ServerLevel)) {
-            blockEntity.tick();
+    /**
+     * Hook H3. Opens a batch for one level's block-entity ticks; from the top of {@code Level.tickBlockEntities}.
+     *
+     * <p>Block entities need their own barrier rather than the tick-wide one, because the loop that dispatches
+     * them has to know when <em>its</em> block entities are done — it clears {@code tickingBlockEntities}
+     * immediately afterwards, which lets queued additions through. Waiting for the whole server tick there
+     * would deadlock: the server tick is waiting for this level.
+     */
+    public static TickBatch startBlockEntityTicks(Level level) {
+        if (!dispatchThisTick || MCMTConfig.disableBlockEntity || !(level instanceof ServerLevel)) {
+            return TickBatch.INLINE;
+        }
+        return new TickBatch(new Phaser(1));
+    }
+
+    /** Hook H3. Ticks one block entity into the batch; from the loop in {@code Level.tickBlockEntities}. */
+    public static void callBlockEntityTick(TickBatch batch, TickingBlockEntity blockEntity, Level level) {
+        Class<?> type = blockEntity.mcmtTickedType();
+        SerDesPool pool = SerDesRegistry.poolFor(SerDesHookType.BLOCK_ENTITY_TICK, type);
+
+        if (batch.isInline()) {
+            runBlockEntityTick(blockEntity, level, type, pool);
             return;
         }
+
         String task = beginTrace("BlockEntityTick", blockEntity);
-        runningBlockEntityTicks.incrementAndGet();
+        batch.taskStarted();
         try {
-            blockEntity.tick();
-        } finally {
-            runningBlockEntityTicks.decrementAndGet();
+            MCMTThreadPool.get().execute(() -> {
+                runningBlockEntityTicks.incrementAndGet();
+                try {
+                    runBlockEntityTick(blockEntity, level, type, pool);
+                } finally {
+                    runningBlockEntityTicks.decrementAndGet();
+                    endTrace(task);
+                    batch.taskFinished();
+                }
+            });
+            dispatchedBlockEntityTicks.incrementAndGet();
+        } catch (Throwable throwable) {
+            batch.taskFinished();
             endTrace(task);
+            throw throwable;
         }
+    }
+
+    /**
+     * Runs one block-entity tick, through its pool if it has one, and demotes its class if it throws.
+     *
+     * <p>Swallowing the exception is deliberate and is what makes MCMT survivable on a modded server. A tick
+     * that throws here has almost certainly lost a race rather than hit a logic bug — the same code has run
+     * single-threaded for years. Crashing the server would punish the owner for MCMT's choice; continuing to
+     * run the class in parallel would keep corrupting the world. Demoting it to a chunk lock does neither.
+     */
+    private static void runBlockEntityTick(TickingBlockEntity blockEntity, Level level, Class<?> type, SerDesPool pool) {
+        try {
+            if (pool == null) {
+                blockEntity.tick();
+            } else {
+                pool.serialise(blockEntity::tick, blockEntity.getPos(), level);
+            }
+        } catch (Throwable throwable) {
+            SerDesRegistry.demote(type, throwable);
+            LOGGER.error("MCMT: exception ticking block entity {} at {}", type.getName(), blockEntity.getPos(), throwable);
+        }
+    }
+
+    /**
+     * Hook H3. Waits for every block entity dispatched into {@code batch}; from the bottom of
+     * {@code Level.tickBlockEntities}, before the ticking flag is cleared.
+     */
+    public static void finishBlockEntityTicks(TickBatch batch) {
+        batch.await();
     }
 
     /** Hook H4. Runs one chunk's environment tick; from {@code ServerChunkCache.tickChunks}. */
@@ -398,6 +468,11 @@ public final class MCMT {
     /** How many level ticks have been handed to the pool since startup. Zero means nothing is parallelised. */
     public static long getDispatchedLevelTicks() {
         return dispatchedLevelTicks.get();
+    }
+
+    /** How many block-entity ticks have been handed to the pool since startup. */
+    public static long getDispatchedBlockEntityTicks() {
+        return dispatchedBlockEntityTicks.get();
     }
 
     public static int getRunningEntityTicks() {

@@ -1,0 +1,13 @@
+--- a/net/minecraft/world/level/block/entity/TickingBlockEntity.java
++++ b/net/minecraft/world/level/block/entity/TickingBlockEntity.java
+@@ -10,4 +_,10 @@
+     BlockPos getPos();
+ 
+     String getType();
++
++    // MCMT hook H3: the class of the block entity actually being ticked, as opposed to that of this wrapper.
++    // That is what decides whether the tick may run in parallel, so it has to see through the wrapping.
++    default Class<?> mcmtTickedType() {
++        return this.getClass();
++    }
+ }
