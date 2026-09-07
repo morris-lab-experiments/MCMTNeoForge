@@ -15,10 +15,12 @@ import net.neoforged.neoforge.mcmt.serdes.filter.AutoFilter;
 import net.neoforged.neoforge.mcmt.serdes.filter.ConfigFilter;
 import net.neoforged.neoforge.mcmt.serdes.filter.DefaultFilter;
 import net.neoforged.neoforge.mcmt.serdes.filter.EntityFilter;
+import net.neoforged.neoforge.mcmt.serdes.filter.HopperFilter;
 import net.neoforged.neoforge.mcmt.serdes.filter.PistonFilter;
 import net.neoforged.neoforge.mcmt.serdes.filter.SerDesFilter;
 import net.neoforged.neoforge.mcmt.serdes.filter.VanillaFilter;
 import net.neoforged.neoforge.mcmt.serdes.pools.ChunkLockPool;
+import net.neoforged.neoforge.mcmt.serdes.pools.PosLockPool;
 import net.neoforged.neoforge.mcmt.serdes.pools.PostExecutePool;
 import net.neoforged.neoforge.mcmt.serdes.pools.SerDesPool;
 import net.neoforged.neoforge.mcmt.serdes.pools.SingleExecutionPool;
@@ -29,8 +31,8 @@ import net.neoforged.neoforge.mcmt.serdes.pools.SingleExecutionPool;
  * <p>Filters are consulted in priority order and the first opinion wins:
  *
  * <ol>
- * <li>{@link PistonFilter} and {@link EntityFilter} — vanilla classes known to reach outside themselves. Not
- * overridable, because overriding them does not make them safe.
+ * <li>{@link PistonFilter}, {@link HopperFilter} and {@link EntityFilter} — vanilla classes known to reach
+ * outside themselves. Not overridable, because overriding them does not make them safe.
  * <li>{@link ConfigFilter} — the server owner's white and black lists.
  * <li>{@link AutoFilter} — classes that have already thrown once while running in parallel.
  * <li>{@link VanillaFilter} — everything else in {@code net.minecraft} runs free.
@@ -51,6 +53,12 @@ public final class SerDesRegistry {
     private static final SerDesPool CHUNK_LOCK = new ChunkLockPool(1);
 
     /**
+     * A block and its six neighbours: the scope a tick needs when it reaches exactly one block, as hoppers do.
+     * Far cheaper than {@link #CHUNK_LOCK} on the dense arrays people actually build.
+     */
+    private static final SerDesPool POS_LOCK = new PosLockPool();
+
+    /**
      * Whole-server serialisation. {@link EntityFilter} routes the vanilla classes that need it here, and an
      * owner can add their own through {@code entitySingleThreadList} / {@code blockEntitySingleThreadList}.
      */
@@ -63,7 +71,8 @@ public final class SerDesRegistry {
 
     private static final List<SerDesFilter> FILTERS = List.of(
             new PistonFilter(CHUNK_LOCK),
-            new EntityFilter(SINGLE, CHUNK_LOCK),
+            new HopperFilter(POS_LOCK),
+            new EntityFilter(SINGLE),
             new ConfigFilter(CHUNK_LOCK, SINGLE),
             AUTO,
             new VanillaFilter(),

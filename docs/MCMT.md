@@ -82,9 +82,10 @@ once the pool is big enough to cover the work — past that, more workers mostly
 Your own numbers will differ; the shape is the point.
 
 > **These numbers predate the hopper fix and overstate the gain.** That load was mostly hoppers,
-> which then ran unsynchronised — and were duplicating items. Hoppers are now chunk-locked, which
-> is much slower. The shape of the curve against worker count still holds; the multipliers do not,
-> and have not yet been re-measured. See *Hoppers are slow under MCMT, on purpose*.
+> which then ran unsynchronised — and were duplicating items, so they were doing less work than
+> correctness requires. Hoppers are now serialised against their neighbours. The shape of the curve
+> against worker count still holds; the multipliers do not, and have not been re-measured against a
+> load that is not hopper-dominated. See *Hoppers are slow under MCMT, on purpose*.
 
 `REDUCTION` is the useful one on a machine that is doing anything else. Minecraft's own
 background executor generates chunks and does world I/O on the same CPUs, so handing every core
@@ -187,11 +188,26 @@ A hopper's tick reads and writes a container that is not its own. Left to run in
 sharing a container both read a slot at n, both take one item, and both write n-1 -- one item consumed,
 two delivered. Measured on 4096 hoppers over 24000 ticks, 129024 items became 429867.
 
-So hoppers are chunk-locked, and that is expensive: a hopper array packed into a few chunks serialises
-almost completely, and on such a load MCMT is currently **slower than leaving it switched off**. If
-your server's tick time is dominated by hopper arrays, MCMT will not help you today.
+So hoppers are serialised against their immediate neighbours — each one locks its own block and the
+six around it, which is exactly the set it can reach. Two hoppers three blocks apart still run at the
+same time; two that share a container never do.
 
-This is a correctness floor, not a tuning knob -- the whitelist deliberately cannot override it.
+That is as fine-grained as the lock can safely be, and a dense hopper array is still slow, because
+**adjacent hoppers genuinely depend on each other**. A row of hoppers passing items along is a chain
+of shared containers, so no amount of lock tuning makes it parallel — the serialisation is in the
+build, not in MCMT. On top of that a single hopper tick is only about a fifth of a microsecond, which
+is less than it costs to hand a task to a worker and take the locks.
+
+Measured on 4096 hoppers packed into 16 chunks:
+
+| | tick rate | ms/tick |
+| --- | --- | --- |
+| MCMT off | 948–1058/s | ~1.0 |
+| MCMT on | 165/s | 6.0 |
+
+**If your tick time is dominated by hopper arrays, MCMT will make it worse, not better.** Turn it off,
+or accept the cost. This is a correctness floor, not a tuning knob — the whitelist deliberately cannot
+override it, because the alternative is a server that mints items.
 
 ## What you are trading away
 
