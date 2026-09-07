@@ -16,6 +16,7 @@ import net.neoforged.neoforge.mcmt.serdes.filter.ConfigFilter;
 import net.neoforged.neoforge.mcmt.serdes.filter.DefaultFilter;
 import net.neoforged.neoforge.mcmt.serdes.filter.EntityFilter;
 import net.neoforged.neoforge.mcmt.serdes.filter.HopperFilter;
+import net.neoforged.neoforge.mcmt.serdes.filter.ItemEntityFilter;
 import net.neoforged.neoforge.mcmt.serdes.filter.PistonFilter;
 import net.neoforged.neoforge.mcmt.serdes.filter.SerDesFilter;
 import net.neoforged.neoforge.mcmt.serdes.filter.VanillaFilter;
@@ -31,8 +32,8 @@ import net.neoforged.neoforge.mcmt.serdes.pools.SingleExecutionPool;
  * <p>Filters are consulted in priority order and the first opinion wins:
  *
  * <ol>
- * <li>{@link PistonFilter}, {@link HopperFilter} and {@link EntityFilter} — vanilla classes known to reach
- * outside themselves. Not overridable, because overriding them does not make them safe.
+ * <li>{@link PistonFilter}, {@link HopperFilter}, {@link ItemEntityFilter} and {@link EntityFilter} — vanilla
+ * classes known to reach outside themselves. Not overridable, because overriding them does not make them safe.
  * <li>{@link ConfigFilter} — the server owner's white and black lists.
  * <li>{@link AutoFilter} — classes that have already thrown once while running in parallel.
  * <li>{@link VanillaFilter} — everything else in {@code net.minecraft}, per {@code vanillaDefault}.
@@ -55,8 +56,12 @@ public final class SerDesRegistry {
     /**
      * A block and its six neighbours: the scope a tick needs when it reaches exactly one block, as hoppers do.
      * Far cheaper than {@link #CHUNK_LOCK} on the dense arrays people actually build.
+     *
+     * <p>Exposed through {@link #posLockPool()} because {@code MCMT.guardItemPickup} takes a lock from this same
+     * table part-way through {@code Mob.aiStep} — a mob claiming an item and that item's own merge tick have to
+     * serialise against each other, which only works if they lock in the same place.
      */
-    private static final SerDesPool POS_LOCK = new PosLockPool();
+    private static final PosLockPool POS_LOCK = new PosLockPool();
 
     /**
      * Whole-server serialisation. {@link EntityFilter} routes the vanilla classes that need it here, and an
@@ -72,6 +77,7 @@ public final class SerDesRegistry {
     private static final List<SerDesFilter> FILTERS = List.of(
             new PistonFilter(CHUNK_LOCK),
             new HopperFilter(POS_LOCK),
+            new ItemEntityFilter(POS_LOCK),
             new EntityFilter(SINGLE),
             new ConfigFilter(CHUNK_LOCK, SINGLE),
             AUTO,
@@ -150,6 +156,15 @@ public final class SerDesRegistry {
     /** Whole-server serialisation, for filters that need it. */
     public static SerDesPool singleExecutionPool() {
         return SINGLE;
+    }
+
+    /**
+     * The block-position lock table. {@code MCMT.guardItemPickup} locks a position in this table around one mob's
+     * attempt to pick up one item, so that every mob reaching that item — and the item's own merge tick, which
+     * {@link ItemEntityFilter} routes here — serialise on the item's block and nothing else.
+     */
+    public static PosLockPool posLockPool() {
+        return POS_LOCK;
     }
 
     /** Forgets every cached decision. Call after anything a filter consults changes. */

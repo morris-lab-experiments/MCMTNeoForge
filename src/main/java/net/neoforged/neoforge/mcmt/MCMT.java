@@ -22,6 +22,7 @@ import net.minecraft.ReportedException;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.entity.TickingBlockEntity;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -392,6 +393,42 @@ public final class MCMT {
     /** Hook H2. Waits for every entity dispatched into {@code batch}; from {@code ServerLevel.tick}. */
     public static void finishEntityTicks(TickBatch batch) {
         batch.await();
+    }
+
+    /**
+     * Hook H2b. Guards one mob's attempt to pick up one item; wraps the {@code pickUpItem} call sites in
+     * {@code Mob.aiStep} and {@code Raider}'s banner goal.
+     *
+     * <p>Mob loot pickup is a read-modify-write across two entities: the mob reads the item's stack, takes some
+     * of it, and discards the item if it emptied. Two mobs reaching one item — which they can do from ~2.6
+     * blocks apart, because the pickup box is the mob's bounding box inflated by one — both pass the pre-checks,
+     * both take the stack, and the item ends up in two hands and still on the ground. The harness measured it
+     * creating roughly one item per 400–500 ticks.
+     *
+     * <p>This cannot be fixed by routing the mob to a pool: the lock would be on the <em>mob's</em> position,
+     * and two mobs 2.6 blocks apart have disjoint locked regions. The scope that works is the <em>item's</em>
+     * position — every mob claiming that item locks the same block, wherever the mobs themselves are — and it
+     * has to be taken here, part-way through the tick, rather than around the whole tick as a filter would.
+     *
+     * <p>The {@code isRemoved} re-check inside the lock is the point of the whole thing: the mob that loses the
+     * race acquires the lock, sees the item already gone, and does nothing. It uses {@link SerDesRegistry}'s
+     * block-position lock table, the same one {@link ItemEntityFilter} routes item-entity ticks to, so a pickup
+     * and a merge that touch one item also serialise.
+     *
+     * @param item    the item this mob is about to try to pick up
+     * @param attempt the vanilla pickup, including its guard conditions — run at most once, and only if the item
+     *                is still present when the lock is held
+     */
+    public static void guardItemPickup(ItemEntity item, Runnable attempt) {
+        if (!dispatchThisTick || MCMTConfig.disableEntity) {
+            attempt.run();
+            return;
+        }
+        SerDesRegistry.posLockPool().serialise(() -> {
+            if (!item.isRemoved()) {
+                attempt.run();
+            }
+        }, item.blockPosition(), item.level());
     }
 
     /**

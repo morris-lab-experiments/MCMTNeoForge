@@ -1,0 +1,12 @@
+--- a/net/minecraft/world/entity/raid/Raider.java
++++ b/net/minecraft/world/entity/raid/Raider.java
+@@ -379,7 +_,8 @@
+                     .level()
+                     .getEntitiesOfClass(ItemEntity.class, this.mob.getBoundingBox().inflate(4.0, 4.0, 4.0), Raider.ALLOWED_ITEMS);
+                 if (!list.isEmpty()) {
+-                    this.mob.pickUpItem(list.get(0));
++                    ItemEntity itementity = list.get(0);
++                    net.neoforged.neoforge.mcmt.MCMT.guardItemPickup(itementity, () -> this.mob.pickUpItem(itementity)); // MCMT hook H2b
+                 }
+             }
+         }

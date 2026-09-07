@@ -60,7 +60,7 @@
      }
  
      @Override
-@@ -539,7 +_,7 @@
+@@ -539,14 +_,16 @@
              && this.canPickUpLoot()
              && this.isAlive()
              && !this.dead
@@ -69,6 +69,15 @@
              Vec3i vec3i = this.getPickupReach();
  
              for (ItemEntity itementity : this.level()
+                 .getEntitiesOfClass(ItemEntity.class, this.getBoundingBox().inflate((double)vec3i.getX(), (double)vec3i.getY(), (double)vec3i.getZ()))) {
++                net.neoforged.neoforge.mcmt.MCMT.guardItemPickup(itementity, () -> { // MCMT hook H2b: two mobs must not claim one item at once
+                 if (!itementity.isRemoved() && !itementity.getItem().isEmpty() && !itementity.hasPickUpDelay() && this.wantsToPickUp(itementity.getItem())) {
+                     this.pickUpItem(itementity);
+                 }
++                });
+             }
+         }
+ 
 @@ -666,6 +_,10 @@
  
      private double getApproximateAttackDamageWithItem(ItemStack p_330413_) {
