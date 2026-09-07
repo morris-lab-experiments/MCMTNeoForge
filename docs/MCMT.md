@@ -81,6 +81,11 @@ At two workers the dispatch overhead is larger than the parallelism is worth. Th
 once the pool is big enough to cover the work — past that, more workers mostly buy contention.
 Your own numbers will differ; the shape is the point.
 
+> **These numbers predate the hopper fix and overstate the gain.** That load was mostly hoppers,
+> which then ran unsynchronised — and were duplicating items. Hoppers are now chunk-locked, which
+> is much slower. The shape of the curve against worker count still holds; the multipliers do not,
+> and have not yet been re-measured. See *Hoppers are slow under MCMT, on purpose*.
+
 `REDUCTION` is the useful one on a machine that is doing anything else. Minecraft's own
 background executor generates chunks and does world I/O on the same CPUs, so handing every core
 to the tick pool can make chunk loading worse while making the tick faster.
@@ -141,9 +146,9 @@ inherited: a subclass in another package is a separate entry.
 An entry naming a class this installation does not have is kept as written and ignored, so one
 config file can serve a modded and a vanilla instance without losing entries on save.
 
-Vanilla classes that are known not to be safe are handled in code rather than config: pistons and
-the sculk blocks are chunk-locked, and falling blocks, primed TNT and allays run single-execution.
-These are not overridable — whitelisting a piston does not make it safe, it makes the world corrupt
+Vanilla classes that are known not to be safe are handled in code rather than config: pistons,
+the sculk blocks and **hoppers** are chunk-locked, and falling blocks, primed TNT and allays run
+single-execution. These are not overridable — whitelisting a piston does not make it safe, it makes the world corrupt
 quietly.
 
 ## Diagnosing problems
@@ -175,6 +180,18 @@ and, if `opsTracing` was enabled, the tasks that were running.
    reaching beyond its own position and wants `singleThreadList` instead; if that does not fix it
    either, the mod is unsafe in a way MCMT cannot contain and the hook has to stay off.
 5. Narrow back the other way with the whitelist, a package at a time, to recover throughput.
+
+## Hoppers are slow under MCMT, on purpose
+
+A hopper's tick reads and writes a container that is not its own. Left to run in parallel, two hoppers
+sharing a container both read a slot at n, both take one item, and both write n-1 -- one item consumed,
+two delivered. Measured on 4096 hoppers over 24000 ticks, 129024 items became 429867.
+
+So hoppers are chunk-locked, and that is expensive: a hopper array packed into a few chunks serialises
+almost completely, and on such a load MCMT is currently **slower than leaving it switched off**. If
+your server's tick time is dominated by hopper arrays, MCMT will not help you today.
+
+This is a correctness floor, not a tuning knob -- the whitelist deliberately cannot override it.
 
 ## What you are trading away
 

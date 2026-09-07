@@ -63,7 +63,7 @@ public final class SerDesRegistry {
 
     private static final List<SerDesFilter> FILTERS = List.of(
             new PistonFilter(CHUNK_LOCK),
-            new EntityFilter(SINGLE),
+            new EntityFilter(SINGLE, CHUNK_LOCK),
             new ConfigFilter(CHUNK_LOCK, SINGLE),
             AUTO,
             new VanillaFilter(),
