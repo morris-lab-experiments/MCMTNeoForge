@@ -1,6 +1,6 @@
 --- a/net/minecraft/server/level/ServerChunkCache.java
 +++ b/net/minecraft/server/level/ServerChunkCache.java
-@@ -58,9 +_,17 @@
+@@ -58,9 +_,20 @@
      private boolean spawnEnemies = true;
      private boolean spawnFriendlies = true;
      private static final int CACHE_SIZE = 4;
@@ -14,14 +14,17 @@
 +        4
 +    );
 +
-+    // MCMT hook: guards the cache-miss path below. getChunkFutureMainThread walks ChunkMap and DistanceManager,
-+    // neither of which tolerates concurrent callers, so only one thread at a time may load a chunk into this
-+    // level. That is no worse than vanilla, where all chunk loading happens on the server thread anyway.
++    // MCMT hook: serialises mutation of the chunk map on the cache-miss path. getChunkFutureMainThread walks
++    // ChunkMap and DistanceManager and the executor pump runs runDistanceManagerUpdates, none of which tolerate
++    // concurrent callers -- so a worker holds this while creating a load future or running one pump iteration,
++    // but not across the wait for async generation in between (MCMT-PLAN §4c / §4i, mcmtPumpUntil). Pool workers
++    // only ever take it with tryLock (mcmtLockCooperatively) and park on failure, so contention here cannot
++    // inflate the worker pool. That is no worse than vanilla, where all chunk loading is on the server thread.
 +    private final java.util.concurrent.locks.ReentrantLock mcmtChunkLoadLock = new java.util.concurrent.locks.ReentrantLock();
      @Nullable
      @VisibleForDebug
      private NaturalSpawner.SpawnState lastSpawnState;
-@@ -110,6 +_,23 @@
+@@ -110,6 +_,80 @@
          return this.lightEngine;
      }
  
@@ -31,15 +34,72 @@
 +     * <p>The three call sites that consult this all branch on "am I the main thread?", and the off-thread
 +     * branch posts the work to {@link #mainThreadProcessor} and joins the result. Under MCMT the main thread is
 +     * parked on the tick barrier for the whole of {@code tickChildren} and will never run that work, so a tick
-+     * worker taking the off-thread branch deadlocks. The main-thread branch instead drains the queue itself via
-+     * {@code managedBlock}, which is what a worker needs.
++     * worker taking the off-thread branch deadlocks. The main-thread branch instead drains the queue itself
++     * (see {@link #mcmtPumpUntil}), which is what a worker needs.
 +     *
 +     * <p>Several workers may hold this at once, so the paths they take have to tolerate it: the recently-used
-+     * cache is an atomic array of immutable entries, and the cache-miss path is serialised by
-+     * {@link #mcmtChunkLoadLock}.
++     * cache is an atomic array of immutable entries, and every mutation of the chunk map on the cache-miss path
++     * is serialised by {@link #mcmtChunkLoadLock}.
 +     */
 +    private boolean mcmtCanDriveDirectly() {
 +        return Thread.currentThread() == this.mainThread || net.neoforged.neoforge.mcmt.MCMT.isPoolThread();
++    }
++
++    /**
++     * MCMT: wait until {@code done} while cooperatively pumping {@link #mainThreadProcessor}, holding
++     * {@link #mcmtChunkLoadLock} for only one {@code pollTask} at a time (MCMT-PLAN §4c).
++     *
++     * <p>This replaces {@code mainThreadProcessor.managedBlock(done)} for callers that hold -- or have just
++     * released -- the load lock. {@code managedBlock} would pump the executor while the caller kept the lock for
++     * the entire wait, blocking every other loader for the duration and, on a pool worker, growing a
++     * compensation thread per blocked acquisition. Here the lock is taken per pump iteration via
++     * {@code tryLock}: exactly one worker mutates {@code ChunkMap} / {@code DistanceManager} at any instant, but
++     * that single pump advances the futures of <em>all</em> waiters, and a worker that fails {@code tryLock}
++     * parks briefly (no {@code ManagedBlocker}, so no compensation thread) rather than queueing on the lock.
++     *
++     * <p>Progress does not depend on becoming the pumper -- being pumped by another waiter is enough -- so the
++     * non-fair {@code tryLock} cannot starve a load. When the current pumper's own future completes it leaves;
++     * the next parked waiter becomes the pumper within one park interval. On the server thread (MCMT off, or a
++     * portal-transiting entity ticking inline) {@code tryLock} always wins and this degrades to the vanilla
++     * {@code managedBlock} loop, {@code throwIfFatalException} check included.
++     */
++    private void mcmtPumpUntil(BooleanSupplier done) {
++        while (!done.getAsBoolean()) {
++            MinecraftServer.throwIfFatalException();
++            boolean pumped = false;
++            if (this.mcmtChunkLoadLock.tryLock()) {
++                try {
++                    if (!done.getAsBoolean()) {
++                        pumped = this.mainThreadProcessor.pollTask();
++                    }
++                } finally {
++                    this.mcmtChunkLoadLock.unlock();
++                }
++            }
++
++            if (!pumped && !done.getAsBoolean()) {
++                Thread.yield();
++                java.util.concurrent.locks.LockSupport.parkNanos("mcmt chunk load", 100000L);
++            }
++        }
++    }
++
++    /**
++     * MCMT: take {@link #mcmtChunkLoadLock} without ever calling a blocking acquire from a pool worker.
++     *
++     * <p>{@code ManagedLock} / {@code lock.lock()} would grow the pool a compensation thread on every contended
++     * acquisition, and this lock is genuinely contended during a generation burst (many workers reach a cache
++     * miss while one pumps {@code runDistanceManagerUpdates}). Under that load the earlier {@code ManagedLock}
++     * version inflated the pool past 280 threads — worse than the residual it was meant to remove. So a worker
++     * that cannot get the lock parks 100 µs and retries, exactly as {@link #mcmtPumpUntil} does; the pool never
++     * grows. The caller must {@code unlock()} in a {@code finally}.
++     */
++    private void mcmtLockCooperatively() {
++        while (!this.mcmtChunkLoadLock.tryLock()) {
++            MinecraftServer.throwIfFatalException();
++            Thread.yield();
++            java.util.concurrent.locks.LockSupport.parkNanos("mcmt chunk load", 100000L);
++        }
 +    }
 +
      @Nullable
@@ -69,7 +129,7 @@
              return CompletableFuture.<ChunkAccess>supplyAsync(() -> this.getChunk(p_8360_, p_8361_, p_330876_, p_8363_), this.mainThreadProcessor).join();
          } else {
              ProfilerFiller profilerfiller = this.level.getProfiler();
-@@ -142,24 +_,51 @@
+@@ -142,22 +_,57 @@
              long i = ChunkPos.asLong(p_8360_, p_8361_);
  
              for (int j = 0; j < 4; j++) {
@@ -91,20 +151,17 @@
              profilerfiller.incrementCounter("getChunkCacheMiss");
 -            CompletableFuture<ChunkResult<ChunkAccess>> completablefuture = this.getChunkFutureMainThread(p_8360_, p_8361_, p_330876_, p_8363_);
 -            this.mainThreadProcessor.managedBlock(completablefuture::isDone);
--            ChunkResult<ChunkAccess> chunkresult = completablefuture.join();
--            ChunkAccess chunkaccess1 = chunkresult.orElse(null);
--            if (chunkaccess1 == null && p_8363_) {
--                throw (IllegalStateException)Util.pauseInIde(new IllegalStateException("Chunk not there when requested: " + chunkresult.getError()));
--            } else {
--                this.storeInCache(i, chunkaccess1, p_330876_);
--                return chunkaccess1;
-+            // MCMT hook: one loader at a time per level. Via ManagedLock rather than a plain lock() so that a
-+            // worker which genuinely has to wait hands its slot back to the pool -- and, just as importantly,
-+            // so that one which does not have to wait costs nothing. This is a cache-miss path taken thousands
-+            // of times a tick and almost never contended; blocking the pool's way round on every one of those
-+            // grew the pool to ~1500 threads. See ManagedLock.
-+            net.neoforged.neoforge.mcmt.parallel.ManagedLock.lock(this.mcmtChunkLoadLock);
-+
++            // MCMT hook: one-pumper-many-waiters (MCMT-PLAN §4c / §4i). The lock still serialises every mutation
++            // of ChunkMap / DistanceManager -- but only for as long as it takes to create the load future, not
++            // for the whole wait on async chunk generation. Once the future exists the lock is dropped and the
++            // worker pumps the chunk-source executor cooperatively (mcmtPumpUntil): whichever waiter holds the
++            // lock at a given instant pumps one task, which advances *every* waiter's future, then releases so
++            // another can create its own load or take a turn pumping. The lock is only ever taken with tryLock
++            // (mcmtLockCooperatively) so a worker that has to wait parks rather than growing the pool a
++            // compensation thread -- before this rework a worker held the lock across the entire managedBlock
++            // wait, and the blocked acquisitions were the residual 145-189 compensation threads from §4b.
++            CompletableFuture<ChunkResult<ChunkAccess>> completablefuture;
++            this.mcmtLockCooperatively();
 +            try {
 +                // Another thread may have loaded it while we waited for the lock.
 +                for (int j = 0; j < 4; j++) {
@@ -117,21 +174,23 @@
 +                    }
 +                }
 +
-+                CompletableFuture<ChunkResult<ChunkAccess>> completablefuture = this.getChunkFutureMainThread(p_8360_, p_8361_, p_330876_, p_8363_);
-+                this.mainThreadProcessor.managedBlock(completablefuture::isDone);
-+                ChunkResult<ChunkAccess> chunkresult = completablefuture.join();
-+                ChunkAccess chunkaccess1 = chunkresult.orElse(null);
-+                if (chunkaccess1 == null && p_8363_) {
-+                    throw (IllegalStateException)Util.pauseInIde(new IllegalStateException("Chunk not there when requested: " + chunkresult.getError()));
-+                } else {
-+                    this.storeInCache(i, chunkaccess1, p_330876_);
-+                    return chunkaccess1;
-+                }
++                completablefuture = this.getChunkFutureMainThread(p_8360_, p_8361_, p_330876_, p_8363_);
 +            } finally {
 +                this.mcmtChunkLoadLock.unlock();
++            }
++
++            this.mcmtPumpUntil(completablefuture::isDone);
+             ChunkResult<ChunkAccess> chunkresult = completablefuture.join();
+             ChunkAccess chunkaccess1 = chunkresult.orElse(null);
+             if (chunkaccess1 == null && p_8363_) {
+                 throw (IllegalStateException)Util.pauseInIde(new IllegalStateException("Chunk not there when requested: " + chunkresult.getError()));
+             } else {
++                // Racy but benign: lastChunks is an AtomicReferenceArray of immutable entries, so a concurrent
++                // storeInCache can only duplicate or drop a whole entry (a later cache miss, at worst), never
++                // publish a torn one. Not worth a lock hold on this hot path.
+                 this.storeInCache(i, chunkaccess1, p_330876_);
+                 return chunkaccess1;
              }
-         }
-     }
 @@ -167,15 +_,16 @@
      @Nullable
      @Override
@@ -160,7 +219,7 @@
                  ChunkAccess chunkaccess1 = chunkholder.getChunkIfPresent(ChunkStatus.FULL);
                  if (chunkaccess1 != null) {
                      this.storeInCache(i, chunkaccess1, ChunkStatus.FULL);
-@@ -198,13 +_,13 @@
+@@ -198,17 +_,26 @@
      }
  
      private void clearCache() {
@@ -177,7 +236,22 @@
 +        boolean flag = this.mcmtCanDriveDirectly(); // MCMT hook H5
          CompletableFuture<ChunkResult<ChunkAccess>> completablefuture;
          if (flag) {
-             completablefuture = this.getChunkFutureMainThread(p_8432_, p_8433_, p_330326_, p_8435_);
+-            completablefuture = this.getChunkFutureMainThread(p_8432_, p_8433_, p_330326_, p_8435_);
+-            this.mainThreadProcessor.managedBlock(completablefuture::isDone);
++            // MCMT hook: same cooperative-lock-then-pump discipline as getChunk (MCMT-PLAN §4c / §4i).
++            // getChunkFutureMainThread walks ChunkMap / DistanceManager, so it runs under the load lock; the wait
++            // afterwards does not. (This branch previously ran unlocked -- only the client debug overlay reaches
++            // it, so it never bit, but it was a latent hole.)
++            this.mcmtLockCooperatively();
++            try {
++                completablefuture = this.getChunkFutureMainThread(p_8432_, p_8433_, p_330326_, p_8435_);
++            } finally {
++                this.mcmtChunkLoadLock.unlock();
++            }
++            this.mcmtPumpUntil(completablefuture::isDone);
+         } else {
+             completablefuture = CompletableFuture.<CompletableFuture<ChunkResult<ChunkAccess>>>supplyAsync(
+                     () -> this.getChunkFutureMainThread(p_8432_, p_8433_, p_330326_, p_8435_), this.mainThreadProcessor
 @@ -352,22 +_,26 @@
                  Util.shuffle(list, this.level.random);
                  int k = this.level.getGameRules().getInt(GameRules.RULE_RANDOMTICKING);
