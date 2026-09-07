@@ -14,10 +14,9 @@ import java.util.concurrent.locks.Lock;
  *
  * <h2>Why this exists</h2>
  *
- * <p>The obvious way to take a lock from a pool worker is
- * {@code RunnableManagedBlocker.runManaged(lock::lock)}, and MCMT did exactly that in three places. It is
- * wrong, in a way that does not show up as contention and so survived a profiling pass that specifically went
- * looking for contention.
+ * <p>The obvious way to take a lock from a pool worker is to wrap {@code lock::lock} in a {@code ManagedBlocker}
+ * built from a {@code Runnable}, and MCMT did exactly that in three places. It is wrong, in a way that does not
+ * show up as contention and so survived a profiling pass that specifically went looking for contention.
  *
  * <p>{@link ForkJoinPool#managedBlock} asks {@link ForkJoinPool.ManagedBlocker#isReleasable()} first, and if the
  * answer is no it <em>starts a replacement thread before calling {@code block()}</em>. A blocker wrapping an

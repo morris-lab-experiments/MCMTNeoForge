@@ -9,6 +9,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import net.neoforged.neoforge.mcmt.config.ClassMatcher;
 import net.neoforged.neoforge.mcmt.config.MCMTConfig;
 import net.neoforged.neoforge.mcmt.serdes.filter.AutoFilter;
 import net.neoforged.neoforge.mcmt.serdes.filter.ConfigFilter;
@@ -49,7 +50,10 @@ public final class SerDesRegistry {
      */
     private static final SerDesPool CHUNK_LOCK = new ChunkLockPool(1);
 
-    /** Available for filters that need whole-server serialisation; nothing routes here by default yet. */
+    /**
+     * Whole-server serialisation. {@link EntityFilter} routes the vanilla classes that need it here, and an
+     * owner can add their own through {@code entitySingleThreadList} / {@code blockEntitySingleThreadList}.
+     */
     private static final SerDesPool SINGLE = new SingleExecutionPool();
 
     /** Drained by {@code MCMT.postTick}. */
@@ -60,7 +64,7 @@ public final class SerDesRegistry {
     private static final List<SerDesFilter> FILTERS = List.of(
             new PistonFilter(CHUNK_LOCK),
             new EntityFilter(SINGLE),
-            new ConfigFilter(CHUNK_LOCK),
+            new ConfigFilter(CHUNK_LOCK, SINGLE),
             AUTO,
             new VanillaFilter(),
             new DefaultFilter(CHUNK_LOCK));
@@ -119,7 +123,7 @@ public final class SerDesRegistry {
     public static int persistAutoDemotions() {
         int added = 0;
         for (Class<?> type : AUTO.demoted()) {
-            Set<Class<?>> target = SerDesHookType.ENTITY_TICK.targets(type)
+            ClassMatcher target = SerDesHookType.ENTITY_TICK.targets(type)
                     ? MCMTConfig.entityBlackList
                     : MCMTConfig.blockEntityBlackList;
             if (target.add(type)) {

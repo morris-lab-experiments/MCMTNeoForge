@@ -17,8 +17,10 @@ import org.apache.logging.log4j.Logger;
  *
  * <p>A {@link ForkJoinPool} rather than a fixed thread pool because tick tasks nest: a level tick dispatches
  * entity ticks, which dispatch block-entity ticks. Work stealing keeps a worker that is blocked inside a nested
- * dispatch from idling, and {@link ForkJoinPool.ManagedBlocker} lets a worker waiting on a chunk lock hand its
- * slot to a compensation thread instead of deadlocking the pool. See {@link RunnableManagedBlocker}.
+ * dispatch from idling, and {@link ForkJoinPool.ManagedBlocker} lets a worker that genuinely has to wait for a
+ * chunk lock hand its slot to a compensation thread instead of deadlocking the pool. See {@link ManagedLock},
+ * and note that "genuinely" is the whole difference — compensating for a wait that was not going to happen is
+ * what once grew this pool to 1582 threads against a target of 32.
  *
  * <p>The pool is created lazily on first use and torn down when the server stops, so a client that never starts
  * an integrated server never pays for the threads.

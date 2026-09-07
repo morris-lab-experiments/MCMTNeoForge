@@ -7,8 +7,6 @@ package net.neoforged.neoforge.mcmt.config;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.event.config.ModConfigEvent;
 import net.neoforged.neoforge.common.ModConfigSpec;
@@ -81,22 +79,22 @@ public final class MCMTConfig {
     public static boolean chunkLockModded;
 
     /** Block-entity classes that are always chunk-locked. Resolved from {@link Template#blockEntityBlackList}. */
-    public static Set<Class<?>> blockEntityBlackList = ConcurrentHashMap.newKeySet();
+    public static final ClassMatcher blockEntityBlackList = new ClassMatcher();
 
-    /** Block-entity classes that are never chunk-locked; overrides the blacklist and {@link #chunkLockModded}. */
-    public static Set<Class<?>> blockEntityWhiteList = ConcurrentHashMap.newKeySet();
+    /** Block-entity classes that are never chunk-locked; overrides every other list and {@link #chunkLockModded}. */
+    public static final ClassMatcher blockEntityWhiteList = new ClassMatcher();
+
+    /** Block-entity classes that may not run concurrently with each other at all, wherever they are. */
+    public static final ClassMatcher blockEntitySingleThreadList = new ClassMatcher();
 
     /** Entity classes that are always chunk-locked. */
-    public static Set<Class<?>> entityBlackList = ConcurrentHashMap.newKeySet();
+    public static final ClassMatcher entityBlackList = new ClassMatcher();
 
     /** Entity classes that are never chunk-locked. */
-    public static Set<Class<?>> entityWhiteList = ConcurrentHashMap.newKeySet();
+    public static final ClassMatcher entityWhiteList = new ClassMatcher();
 
-    /**
-     * Class names from the four lists above that could not be resolved in this environment (a mod is absent, or
-     * the name is a typo). Kept so that {@link #save()} does not silently drop them from the config file.
-     */
-    public static List<String> unresolvedClassNames = new ArrayList<>();
+    /** Entity classes that may not run concurrently with each other at all, wherever they are. */
+    public static final ClassMatcher entitySingleThreadList = new ClassMatcher();
 
     /**
      * When true, every dispatched task registers a human-readable name in {@code MCMT.currentTasks} for the
@@ -121,8 +119,10 @@ public final class MCMTConfig {
         public final BooleanValue chunkLockModded;
         public final ConfigValue<List<? extends String>> blockEntityBlackList;
         public final ConfigValue<List<? extends String>> blockEntityWhiteList;
+        public final ConfigValue<List<? extends String>> blockEntitySingleThreadList;
         public final ConfigValue<List<? extends String>> entityBlackList;
         public final ConfigValue<List<? extends String>> entityWhiteList;
+        public final ConfigValue<List<? extends String>> entitySingleThreadList;
         public final BooleanValue opsTracing;
 
         Template(ModConfigSpec.Builder builder) {
@@ -175,19 +175,36 @@ public final class MCMTConfig {
             builder.pop();
 
             builder.comment("Which entity and block-entity classes may not run freely in parallel.",
-                    "Blacklisted classes are chunk-locked: their tick takes a lock on the chunks around them,",
-                    "so two of them near each other are serialised while distant ones still run concurrently.",
-                    "The whitelist wins over both the blacklist and chunkLockModded.",
-                    "Entries are fully-qualified class names. Unknown names are kept but ignored.")
+                    "",
+                    "Three lists, in order of precedence, each naming classes to be run a particular way:",
+                    "  whiteList        - run free, with no constraint at all. Wins over everything below,",
+                    "                     including chunkLockModded, so a broad rule can be narrowed by exception.",
+                    "  singleThreadList - never run concurrently with anything else on this list, anywhere in any",
+                    "                     dimension. For ticks whose effects are not bounded by position: something",
+                    "                     that walks a global registry, or moves objects between dimensions.",
+                    "  blackList        - chunk-locked. The tick takes a lock on the chunks around it, so two of",
+                    "                     them near each other are serialised while distant ones still run at once.",
+                    "                     This is the right answer for ordinary machinery, and much cheaper than",
+                    "                     singleThreadList; reach for that only when position-scoped locking cannot help.",
+                    "",
+                    "Entries are fully-qualified class names, or wildcard patterns:",
+                    "  com.example.mod.BlockEntityFoo  - that class",
+                    "  com.example.mod.*               - every class directly in that package",
+                    "  com.example.mod.**              - that package and everything beneath it",
+                    "A single * also spans the $ of a nested class, so com.example.Foo* covers com.example.Foo$Ticker.",
+                    "Matching is on the class's own name and is not inherited. Names that no loaded class has are",
+                    "kept as configured but ignored, so one config file can serve a modded and a vanilla instance.")
                     .push("serdes");
             chunkLockModded = builder
                     .comment("Chunk-lock every block entity and entity whose class is not part of vanilla Minecraft.",
                             "This is the safe default: modded tick code has never been audited for thread safety.")
                     .define("chunkLockModded", true);
-            blockEntityBlackList = builder.defineList("blockEntityBlackList", List.of(), o -> o instanceof String);
-            blockEntityWhiteList = builder.defineList("blockEntityWhiteList", List.of(), o -> o instanceof String);
-            entityBlackList = builder.defineList("entityBlackList", List.of(), o -> o instanceof String);
-            entityWhiteList = builder.defineList("entityWhiteList", List.of(), o -> o instanceof String);
+            blockEntityBlackList = builder.defineListAllowEmpty("blockEntityBlackList", List.of(), () -> "", o -> o instanceof String);
+            blockEntityWhiteList = builder.defineListAllowEmpty("blockEntityWhiteList", List.of(), () -> "", o -> o instanceof String);
+            blockEntitySingleThreadList = builder.defineListAllowEmpty("blockEntitySingleThreadList", List.of(), () -> "", o -> o instanceof String);
+            entityBlackList = builder.defineListAllowEmpty("entityBlackList", List.of(), () -> "", o -> o instanceof String);
+            entityWhiteList = builder.defineListAllowEmpty("entityWhiteList", List.of(), () -> "", o -> o instanceof String);
+            entitySingleThreadList = builder.defineListAllowEmpty("entitySingleThreadList", List.of(), () -> "", o -> o instanceof String);
             builder.pop();
         }
     }
@@ -266,12 +283,12 @@ public final class MCMTConfig {
 
         chunkLockModded = SPEC_VALUES.chunkLockModded.get();
 
-        List<String> unresolved = new ArrayList<>();
-        blockEntityBlackList = resolve(SPEC_VALUES.blockEntityBlackList.get(), unresolved);
-        blockEntityWhiteList = resolve(SPEC_VALUES.blockEntityWhiteList.get(), unresolved);
-        entityBlackList = resolve(SPEC_VALUES.entityBlackList.get(), unresolved);
-        entityWhiteList = resolve(SPEC_VALUES.entityWhiteList.get(), unresolved);
-        unresolvedClassNames = unresolved;
+        blockEntityBlackList.load(SPEC_VALUES.blockEntityBlackList.get());
+        blockEntityWhiteList.load(SPEC_VALUES.blockEntityWhiteList.get());
+        blockEntitySingleThreadList.load(SPEC_VALUES.blockEntitySingleThreadList.get());
+        entityBlackList.load(SPEC_VALUES.entityBlackList.get());
+        entityWhiteList.load(SPEC_VALUES.entityWhiteList.get());
+        entitySingleThreadList.load(SPEC_VALUES.entitySingleThreadList.get());
 
         // Filters read the lists and chunkLockModded above, and their answers are cached per class.
         net.neoforged.neoforge.mcmt.serdes.SerDesRegistry.invalidate();
@@ -293,45 +310,23 @@ public final class MCMTConfig {
 
         SPEC_VALUES.chunkLockModded.set(chunkLockModded);
 
-        SPEC_VALUES.blockEntityBlackList.set(names(blockEntityBlackList, SPEC_VALUES.blockEntityBlackList.get()));
-        SPEC_VALUES.blockEntityWhiteList.set(names(blockEntityWhiteList, SPEC_VALUES.blockEntityWhiteList.get()));
-        SPEC_VALUES.entityBlackList.set(names(entityBlackList, SPEC_VALUES.entityBlackList.get()));
-        SPEC_VALUES.entityWhiteList.set(names(entityWhiteList, SPEC_VALUES.entityWhiteList.get()));
+        SPEC_VALUES.blockEntityBlackList.set(blockEntityBlackList.toConfigList());
+        SPEC_VALUES.blockEntityWhiteList.set(blockEntityWhiteList.toConfigList());
+        SPEC_VALUES.blockEntitySingleThreadList.set(blockEntitySingleThreadList.toConfigList());
+        SPEC_VALUES.entityBlackList.set(entityBlackList.toConfigList());
+        SPEC_VALUES.entityWhiteList.set(entityWhiteList.toConfigList());
+        SPEC_VALUES.entitySingleThreadList.set(entitySingleThreadList.toConfigList());
 
         SPEC.save();
     }
 
-    /**
-     * Turns configured class names into classes. Names that do not resolve in this environment are collected into
-     * {@code unresolved} rather than dropped, so a config shared between a modded and a vanilla instance survives
-     * a round trip through {@link #save()}.
-     */
-    private static Set<Class<?>> resolve(List<? extends String> classNames, List<String> unresolved) {
-        Set<Class<?>> resolved = ConcurrentHashMap.newKeySet();
-        for (String name : classNames) {
-            try {
-                resolved.add(Class.forName(name, false, MCMTConfig.class.getClassLoader()));
-            } catch (ClassNotFoundException | LinkageError e) {
-                LOGGER.debug("MCMT: config lists class {}, which is not present in this environment", name);
-                unresolved.add(name);
-            }
-        }
-        return resolved;
-    }
-
-    /**
-     * Renders a baked class set back to names, re-adding whichever of the previously configured names failed to
-     * resolve. {@code previous} is the list as it stands on disk.
-     */
-    private static List<String> names(Set<Class<?>> classes, List<? extends String> previous) {
-        List<String> out = new ArrayList<>(classes.size());
-        for (Class<?> c : classes) {
-            out.add(c.getName());
-        }
-        for (String name : previous) {
-            if (unresolvedClassNames.contains(name)) {
-                out.add(name);
-            }
+    /** Every configured entry that names a class absent from this environment, for {@code /mcmt stats}. */
+    public static List<String> unresolvedClassNames() {
+        List<String> out = new ArrayList<>();
+        for (ClassMatcher list : List.of(
+                blockEntityBlackList, blockEntityWhiteList, blockEntitySingleThreadList,
+                entityBlackList, entityWhiteList, entitySingleThreadList)) {
+            out.addAll(list.unresolved());
         }
         return out;
     }

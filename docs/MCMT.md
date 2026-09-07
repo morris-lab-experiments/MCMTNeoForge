@@ -105,16 +105,46 @@ which ones need serialising and how:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `chunkLockModded` | `true` | Chunk-lock every entity and block entity whose class is not vanilla Minecraft. |
-| `blockEntityBlackList` / `entityBlackList` | empty | Fully-qualified class names to chunk-lock. |
-| `blockEntityWhiteList` / `entityWhiteList` | empty | Fully-qualified class names to run free. Wins over both the blacklist and `chunkLockModded`. |
+| `blockEntityWhiteList` / `entityWhiteList` | empty | Run free. Wins over everything below, including `chunkLockModded`. |
+| `blockEntitySingleThreadList` / `entitySingleThreadList` | empty | Run single-execution. |
+| `blockEntityBlackList` / `entityBlackList` | empty | Chunk-lock. |
+
+The three lists are consulted in that order, so the whitelist narrows either of the others by
+exception. A class named on both of the other two is chunk-locked *and* single-executed by an owner
+who evidently is not sure, so the stricter of the two wins.
 
 `chunkLockModded = true` is the safe default and should stay on unless you have a specific reason.
 Modded tick code has never had to be thread-safe before, so assuming it is not is the only
 defensible starting position. Whitelisting a mod's classes is how you buy back the throughput,
 one mod at a time, once you have reason to believe that mod is safe.
 
+Prefer the blacklist to the single-thread list. Chunk-locking costs nothing when the two ticking
+objects are far apart, which is the usual case; single execution costs the whole parallelism of
+that class everywhere in every dimension. Reach for it only when position-scoped locking cannot
+help in principle — a tick that walks a global registry, or moves objects between dimensions.
+
+### Naming classes
+
+Entries in any of the three lists are fully-qualified class names or wildcard patterns:
+
+| Entry | Matches |
+| --- | --- |
+| `com.example.mod.BlockEntityFoo` | that class alone |
+| `com.example.mod.*` | every class directly in that package |
+| `com.example.mod.**` | that package and everything beneath it |
+| `com.example.mod.Foo*` | `Foo`, and nested classes such as `Foo$Ticker` |
+
+A single `*` stops at a package separator but crosses the `$` of a nested class, which is where a
+good deal of mod tick code actually lives. Matching is on the class's own name and is **not**
+inherited: a subclass in another package is a separate entry.
+
+An entry naming a class this installation does not have is kept as written and ignored, so one
+config file can serve a modded and a vanilla instance without losing entries on save.
+
 Vanilla classes that are known not to be safe are handled in code rather than config: pistons and
 the sculk blocks are chunk-locked, and falling blocks, primed TNT and allays run single-execution.
+These are not overridable — whitelisting a piston does not make it safe, it makes the world corrupt
+quietly.
 
 ## Diagnosing problems
 
@@ -140,6 +170,11 @@ and, if `opsTracing` was enabled, the tasks that were running.
 3. Inside that loop, the question is *race* or *thread identity*. Races come and go with timing;
    thread-identity problems do not. A failure that survives serialising the loop is code checking
    which thread it is on, not two threads colliding.
+4. Once you suspect a mod, blacklist all of it at once — `com.example.mod.**` — and confirm the
+   problem goes away before narrowing. If chunk-locking the whole mod does not fix it, the tick is
+   reaching beyond its own position and wants `singleThreadList` instead; if that does not fix it
+   either, the mod is unsafe in a way MCMT cannot contain and the hook has to stay off.
+5. Narrow back the other way with the whitelist, a package at a time, to recover throughput.
 
 ## What you are trading away
 
