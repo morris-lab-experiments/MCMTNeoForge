@@ -35,7 +35,7 @@ import net.neoforged.neoforge.mcmt.serdes.pools.SingleExecutionPool;
  * outside themselves. Not overridable, because overriding them does not make them safe.
  * <li>{@link ConfigFilter} — the server owner's white and black lists.
  * <li>{@link AutoFilter} — classes that have already thrown once while running in parallel.
- * <li>{@link VanillaFilter} — everything else in {@code net.minecraft} runs free.
+ * <li>{@link VanillaFilter} — everything else in {@code net.minecraft}, per {@code vanillaDefault}.
  * <li>{@link DefaultFilter} — modded code of unknown thread-safety; chunk-locked by default.
  * </ol>
  *
@@ -75,7 +75,7 @@ public final class SerDesRegistry {
             new EntityFilter(SINGLE),
             new ConfigFilter(CHUNK_LOCK, SINGLE),
             AUTO,
-            new VanillaFilter(),
+            new VanillaFilter(POS_LOCK, CHUNK_LOCK),
             new DefaultFilter(CHUNK_LOCK));
 
     /**

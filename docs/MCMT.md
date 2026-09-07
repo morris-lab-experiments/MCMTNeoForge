@@ -110,6 +110,7 @@ which ones need serialising and how:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
+| `vanillaDefault` | `FREE` | What a vanilla class no rule mentions gets: `FREE`, `POS_LOCK` (its block and the six around it) or `CHUNK_LOCK`. |
 | `chunkLockModded` | `true` | Chunk-lock every entity and block entity whose class is not vanilla Minecraft. |
 | `blockEntityWhiteList` / `entityWhiteList` | empty | Run free. Wins over everything below, including `chunkLockModded`. |
 | `blockEntitySingleThreadList` / `entitySingleThreadList` | empty | Run single-execution. |
@@ -128,6 +129,30 @@ Prefer the blacklist to the single-thread list. Chunk-locking costs nothing when
 objects are far apart, which is the usual case; single execution costs the whole parallelism of
 that class everywhere in every dimension. Reach for it only when position-scoped locking cannot
 help in principle — a tick that walks a global registry, or moves objects between dimensions.
+
+### `vanillaDefault`, and what it is honestly worth
+
+`FREE` is a bet that every unsafe vanilla class is named in MCMT's code. That bet has been wrong three
+times — hoppers, item-entity merging and mob loot pickup each duplicated or destroyed items — and each
+time it failed *silently*, because the list of unsafe classes was assembled from crashes and none of
+these ever crashed.
+
+So you can invert it. Measured on a world of 4096 hoppers, a merge cluster and 200 item-collecting mobs:
+
+| `vanillaDefault` | tick rate | hopper array | item merging | mob pickup |
+| --- | --- | --- | --- | --- |
+| `FREE` | 128/s | correct | **loses items** | **duplicates items** |
+| `POS_LOCK` | 86/s | correct | correct | **duplicates items** |
+| `CHUNK_LOCK` | 49/s | correct | correct | not proven either way |
+
+Locking more is not simply safer. `POS_LOCK` fixes item merging because two items merge within half a
+block, so their locks always overlap — but it does not fix mob pickup, because a mob reaches 1.3 blocks
+including diagonals and two mobs can claim one item from further apart than the lock covers. A lock
+helps only when its scope matches the interaction's actual reach.
+
+**Recommendation: leave it at `FREE`.** It costs a third of your throughput to fix one of two open
+bugs, and that bug is better fixed in code. Raise it only if you would genuinely rather run slowly than
+risk item duplication, and understand that even `CHUNK_LOCK` is not a guarantee.
 
 ### Naming classes
 

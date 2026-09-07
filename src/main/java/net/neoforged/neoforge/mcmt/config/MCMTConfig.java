@@ -38,6 +38,27 @@ public final class MCMTConfig {
 
     private MCMTConfig() {}
 
+    /**
+     * What happens to a vanilla class that no filter has an opinion about.
+     *
+     * <p>MCMT's original bet was {@link #FREE}: vanilla is a known, finite body of code, and the handful of
+     * classes that cannot run in parallel are named explicitly. That bet has now been wrong three times —
+     * hoppers, item merging and mob loot pickup all duplicated or destroyed items — and each time the failure
+     * was silent, because the list of unsafe classes was assembled from what crashed rather than from what
+     * quietly diverged.
+     *
+     * <p>So the default is a dial rather than an assumption. Locking costs throughput; being wrong costs the
+     * world.
+     */
+    public enum VanillaDefault {
+        /** Unlisted vanilla runs unconstrained. Fastest, and what MCMT and JMT-MCMT have always done. */
+        FREE,
+        /** Unlisted vanilla locks its own block and the six around it. Covers a tick that reaches one block. */
+        POS_LOCK,
+        /** Unlisted vanilla locks the square of chunks around it. Covers a tick that reaches further. */
+        CHUNK_LOCK
+    }
+
     /** How {@link #paraMax} is interpreted when sizing the worker pool. */
     public enum ParaMaxMode {
         /** {@code paraMax} is an upper bound, clamped to the available processor count. */
@@ -78,6 +99,9 @@ public final class MCMTConfig {
     /** When true, block entities whose class is not part of vanilla are chunk-locked rather than run freely. */
     public static boolean chunkLockModded;
 
+    /** What an unlisted vanilla class gets. See {@link VanillaDefault}. */
+    public static VanillaDefault vanillaDefault;
+
     /** Block-entity classes that are always chunk-locked. Resolved from {@link Template#blockEntityBlackList}. */
     public static final ClassMatcher blockEntityBlackList = new ClassMatcher();
 
@@ -117,6 +141,7 @@ public final class MCMTConfig {
         public final BooleanValue disableEnvironment;
         public final BooleanValue disableChunkProvider;
         public final BooleanValue chunkLockModded;
+        public final EnumValue<VanillaDefault> vanillaDefault;
         public final ConfigValue<List<? extends String>> blockEntityBlackList;
         public final ConfigValue<List<? extends String>> blockEntityWhiteList;
         public final ConfigValue<List<? extends String>> blockEntitySingleThreadList;
@@ -199,6 +224,18 @@ public final class MCMTConfig {
                     .comment("Chunk-lock every block entity and entity whose class is not part of vanilla Minecraft.",
                             "This is the safe default: modded tick code has never been audited for thread safety.")
                     .define("chunkLockModded", true);
+            vanillaDefault = builder
+                    .comment("What a vanilla class that no rule mentions is allowed to do.",
+                            "FREE       - run unconstrained. Fastest, and what MCMT has always assumed.",
+                            "POS_LOCK   - lock its own block and the six around it.",
+                            "CHUNK_LOCK - lock the square of chunks around it.",
+                            "",
+                            "FREE is a bet that vanilla's unsafe classes are all named in the code. That bet has",
+                            "been wrong three times so far - hoppers, item merging and mob loot pickup each",
+                            "duplicated or destroyed items - and every time it failed silently, because the list",
+                            "was built from crashes and none of these ever crashed. POS_LOCK buys most of the",
+                            "safety back for part of the throughput; measure before choosing.")
+                    .defineEnum("vanillaDefault", VanillaDefault.FREE);
             blockEntityBlackList = builder.defineListAllowEmpty("blockEntityBlackList", List.of(), () -> "", o -> o instanceof String);
             blockEntityWhiteList = builder.defineListAllowEmpty("blockEntityWhiteList", List.of(), () -> "", o -> o instanceof String);
             blockEntitySingleThreadList = builder.defineListAllowEmpty("blockEntitySingleThreadList", List.of(), () -> "", o -> o instanceof String);
@@ -282,6 +319,7 @@ public final class MCMTConfig {
         disableChunkProvider = SPEC_VALUES.disableChunkProvider.get();
 
         chunkLockModded = SPEC_VALUES.chunkLockModded.get();
+        vanillaDefault = SPEC_VALUES.vanillaDefault.get();
 
         blockEntityBlackList.load(SPEC_VALUES.blockEntityBlackList.get());
         blockEntityWhiteList.load(SPEC_VALUES.blockEntityWhiteList.get());
@@ -309,6 +347,7 @@ public final class MCMTConfig {
         SPEC_VALUES.disableChunkProvider.set(disableChunkProvider);
 
         SPEC_VALUES.chunkLockModded.set(chunkLockModded);
+        SPEC_VALUES.vanillaDefault.set(vanillaDefault);
 
         SPEC_VALUES.blockEntityBlackList.set(blockEntityBlackList.toConfigList());
         SPEC_VALUES.blockEntityWhiteList.set(blockEntityWhiteList.toConfigList());
