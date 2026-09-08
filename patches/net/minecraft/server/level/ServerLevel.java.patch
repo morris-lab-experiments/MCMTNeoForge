@@ -12,6 +12,23 @@
      private final PersistentEntitySectionManager<Entity> entityManager;
      private final GameEventDispatcher gameEventDispatcher;
      public boolean noSave;
+@@ -190,8 +_,15 @@
+     private final LevelTicks<Block> blockTicks = new LevelTicks<>(this::isPositionTickingWithEntitiesLoaded, this.getProfilerSupplier());
+     private final LevelTicks<Fluid> fluidTicks = new LevelTicks<>(this::isPositionTickingWithEntitiesLoaded, this.getProfilerSupplier());
+     private final PathTypeCache pathTypesByPosCache = new PathTypeCache();
++    // MCMT: iterated in sendBlockUpdated while onTrackingStart/onTrackingEnd add and remove from workers. The
++    // type is unchanged (keeps the patch import-clean); every access is instead wrapped in
++    // synchronized (this.navigatingMobs).
+     final Set<Mob> navigatingMobs = new ObjectOpenHashSet<>();
+-    volatile boolean isUpdatingNavigations;
++    // MCMT: per-thread. This is a reentrancy guard -- "am I already inside sendBlockUpdated's recompute loop on
++    // this thread" -- and under MCMT several workers run sendBlockUpdated at once; a shared field made each trip
++    // the others' guard and spam the log. Cross-mob safety is handled by deferring the recompute instead (see
++    // sendBlockUpdated) and by the navigatingMobs monitor.
++    final ThreadLocal<Boolean> isUpdatingNavigations = ThreadLocal.withInitial(() -> false);
+     protected final Raids raids;
+     private final ObjectLinkedOpenHashSet<BlockEventData> blockEvents = new ObjectLinkedOpenHashSet<>();
+     private final List<BlockEventData> blockEventsToReschedule = new ArrayList<>(64);
 @@ -199,7 +_,7 @@
      private final List<CustomSpawner> customSpawners;
      @Nullable
@@ -218,7 +235,7 @@
          this.server
              .getPlayerList()
              .broadcast(
-@@ -1019,6 +_,7 @@
+@@ -1019,12 +_,13 @@
  
      @Override
      public void gameEvent(Holder<GameEvent> p_316597_, Vec3 p_215042_, GameEvent.Context p_215043_) {
@@ -226,7 +243,55 @@
          this.gameEventDispatcher.post(p_316597_, p_215042_, p_215043_);
      }
  
-@@ -1057,11 +_,16 @@
+     @Override
+     public void sendBlockUpdated(BlockPos p_8755_, BlockState p_8756_, BlockState p_8757_, int p_8758_) {
+-        if (this.isUpdatingNavigations) {
++        if (this.isUpdatingNavigations.get()) {
+             String s = "recursive call to sendBlockUpdated";
+             Util.logAndPauseIfInIde("recursive call to sendBlockUpdated", new IllegalStateException("recursive call to sendBlockUpdated"));
+         }
+@@ -1036,7 +_,15 @@
+         if (Shapes.joinIsNotEmpty(voxelshape1, voxelshape, BooleanOp.NOT_SAME)) {
+             List<PathNavigation> list = new ObjectArrayList<>();
+ 
+-            for (Mob mob : this.navigatingMobs) {
++            // MCMT: navigatingMobs is a plain ObjectOpenHashSet and onTrackingStart/onTrackingEnd add and
++            // remove from workers. Snapshot under its monitor; shouldRecomputePath is cheap (no pathfinding)
++            // and safe to leave outside the lock.
++            List<Mob> navigating;
++            synchronized (this.navigatingMobs) {
++                navigating = new ObjectArrayList<>(this.navigatingMobs);
++            }
++
++            for (Mob mob : navigating) {
+                 PathNavigation pathnavigation = mob.getNavigation();
+                 if (pathnavigation.shouldRecomputePath(p_8755_)) {
+                     list.add(pathnavigation);
+@@ -1044,24 +_,37 @@
+             }
+ 
+             try {
+-                this.isUpdatingNavigations = true;
++                this.isUpdatingNavigations.set(true);
+ 
+                 for (PathNavigation pathnavigation1 : list) {
+-                    pathnavigation1.recomputePath();
++                    // MCMT: a worker running this must not pathfind on another mob's navigation while that mob
++                    // ticks on its own worker -- PathFinder / BinaryHeap are per-mob and single-threaded. Off the
++                    // server thread, just mark the path stale; the mob recomputes it on its own next tick (which
++                    // is what vanilla already does when the last recompute was within 20 ticks anyway).
++                    if (net.neoforged.neoforge.mcmt.MCMT.isPoolThread()) {
++                        pathnavigation1.markPathStaleForMcmt();
++                    } else {
++                        pathnavigation1.recomputePath();
++                    }
+                 }
+             } finally {
+-                this.isUpdatingNavigations = false;
++                this.isUpdatingNavigations.set(false);
+             }
+         }
+     }
  
      @Override
      public void updateNeighborsAt(BlockPos p_215045_, Block p_215046_) {
@@ -243,8 +308,22 @@
          this.neighborUpdater.updateNeighborsAtExceptFromFacing(p_215052_, p_215053_, p_215054_);
      }
  
-@@ -1713,8 +_,8 @@
-                 ServerLevel.this.navigatingMobs.add(mob);
+@@ -1703,18 +_,20 @@
+             }
+ 
+             if (p_143371_ instanceof Mob mob) {
+-                if (ServerLevel.this.isUpdatingNavigations) {
++                if (ServerLevel.this.isUpdatingNavigations.get()) {
+                     String s = "onTrackingStart called during navigation iteration";
+                     Util.logAndPauseIfInIde(
+                         "onTrackingStart called during navigation iteration", new IllegalStateException("onTrackingStart called during navigation iteration")
+                     );
+                 }
+ 
+-                ServerLevel.this.navigatingMobs.add(mob);
++                synchronized (ServerLevel.this.navigatingMobs) { // MCMT: races sendBlockUpdated's snapshot
++                    ServerLevel.this.navigatingMobs.add(mob);
++                }
              }
  
 -            if (p_143371_ instanceof EnderDragon enderdragon) {
@@ -254,8 +333,12 @@
                      ServerLevel.this.dragonParts.put(enderdragonpart.getId(), enderdragonpart);
                  }
              }
-@@ -1733,24 +_,111 @@
-                 if (ServerLevel.this.isUpdatingNavigations) {
+@@ -1730,27 +_,116 @@
+             }
+ 
+             if (p_143375_ instanceof Mob mob) {
+-                if (ServerLevel.this.isUpdatingNavigations) {
++                if (ServerLevel.this.isUpdatingNavigations.get()) {
                      String s = "onTrackingStart called during navigation iteration";
                      Util.logAndPauseIfInIde(
 -                        "onTrackingStart called during navigation iteration", new IllegalStateException("onTrackingStart called during navigation iteration")
@@ -263,7 +346,10 @@
                      );
                  }
  
-                 ServerLevel.this.navigatingMobs.remove(mob);
+-                ServerLevel.this.navigatingMobs.remove(mob);
++                synchronized (ServerLevel.this.navigatingMobs) { // MCMT: races sendBlockUpdated's snapshot
++                    ServerLevel.this.navigatingMobs.remove(mob);
++                }
              }
  
 -            if (p_143375_ instanceof EnderDragon enderdragon) {

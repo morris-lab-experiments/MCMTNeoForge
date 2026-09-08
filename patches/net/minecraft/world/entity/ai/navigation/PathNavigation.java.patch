@@ -1,5 +1,22 @@
 --- a/net/minecraft/world/entity/ai/navigation/PathNavigation.java
 +++ b/net/minecraft/world/entity/ai/navigation/PathNavigation.java
+@@ -79,6 +_,16 @@
+         this.speedModifier = p_26518_;
+     }
+ 
++    /**
++     * MCMT: request a recompute without doing any pathfinding, for callers on a worker thread (ServerLevel's
++     * sendBlockUpdated recompute loop). The owning mob picks {@code hasDelayedRecomputation} up in its own
++     * {@link #tick()} on its own thread, so PathFinder / BinaryHeap stay single-threaded. A plain boolean write
++     * is enough -- it is read every tick and a one-tick visibility lag does not matter.
++     */
++    public void markPathStaleForMcmt() {
++        this.hasDelayedRecomputation = true;
++    }
++
+     public void recomputePath() {
+         if (this.level.getGameTime() - this.timeLastRecompute > 20L) {
+             if (this.targetPos != null) {
 @@ -232,10 +_,10 @@
          Vec3 vec3 = this.getTempMobPos();
          this.maxDistanceToWaypoint = this.mob.getBbWidth() > 0.75F ? this.mob.getBbWidth() / 2.0F : 0.75F - this.mob.getBbWidth() / 2.0F;
@@ -13,4 +30,25 @@
 +        boolean flag = d0 <= (double)this.maxDistanceToWaypoint && d2 <= (double)this.maxDistanceToWaypoint && d1 < 1.0D; //Forge: Fix MC-94054
          if (flag || this.canCutCorner(this.path.getNextNode().type) && this.shouldTargetNextNodeInDirection(vec3)) {
              this.path.advance();
+         }
+@@ -383,12 +_,17 @@
+     }
+ 
+     public boolean shouldRecomputePath(BlockPos p_200904_) {
++        // MCMT: this runs on a worker (ServerLevel.sendBlockUpdated) while the owning mob may be replacing
++        // this.path on its own thread (moveTo nulls it briefly). Snapshot once so a concurrent write cannot turn
++        // a passed null check into an NPE two lines later; a slightly stale read only over- or under-marks a
++        // recompute, which the next block update corrects.
++        Path path = this.path;
+         if (this.hasDelayedRecomputation) {
+             return false;
+-        } else if (this.path != null && !this.path.isDone() && this.path.getNodeCount() != 0) {
+-            Node node = this.path.getEndNode();
++        } else if (path != null && !path.isDone() && path.getNodeCount() != 0) {
++            Node node = path.getEndNode();
+             Vec3 vec3 = new Vec3(((double)node.x + this.mob.getX()) / 2.0, ((double)node.y + this.mob.getY()) / 2.0, ((double)node.z + this.mob.getZ()) / 2.0);
+-            return p_200904_.closerToCenterThan(vec3, (double)(this.path.getNodeCount() - this.path.getNextNodeIndex()));
++            return p_200904_.closerToCenterThan(vec3, (double)(path.getNodeCount() - path.getNextNodeIndex()));
+         } else {
+             return false;
          }
