@@ -1,0 +1,157 @@
+--- a/net/minecraft/world/level/entity/EntitySectionStorage.java
++++ b/net/minecraft/world/level/entity/EntitySectionStorage.java
+@@ -27,6 +_,16 @@
+     private final Long2ObjectMap<EntitySection<T>> sections = new Long2ObjectOpenHashMap<>();
+     private final LongSortedSet sectionIds = new LongAVLTreeSet();
+ 
++    // MCMT hook H2: sections and sectionIds are plain fastutil collections. They are written when an entity
++    // crosses a section boundary or a section empties (getOrCreateSection / remove, both reached under
++    // PersistentEntitySectionManager's structural lock) and read on every Level.getEntities call -- which under
++    // MCMT runs on entity-tick workers. A worker iterating sectionIds while another re-sectioned an entity walked
++    // a half-rebalanced LongAVLTreeSet and NPEd deep inside a mob's aiStep (MCMT-PLAN 4k). This monitor makes
++    // every access to the two collections atomic. The hot read path (forEachAccessibleNonEmptySection) copies the
++    // matching sections out under the monitor and then runs the caller's consumer with it released, so a slow
++    // entity query never blocks re-sectioning, and arbitrary AI code in the consumer never runs under the lock.
++    private final Object mcmtLock = new Object();
++
+     public EntitySectionStorage(Class<T> p_156855_, Long2ObjectFunction<Visibility> p_156856_) {
+         this.entityClass = p_156855_;
+         this.intialSectionVisibility = p_156856_;
+@@ -41,38 +_,51 @@
+         int j1 = SectionPos.posToSectionCoord(p_188363_.maxY + 0.0);
+         int k1 = SectionPos.posToSectionCoord(p_188363_.maxZ + 2.0);
+ 
+-        for (int l1 = j; l1 <= i1; l1++) {
+-            long i2 = SectionPos.asLong(l1, 0, 0);
+-            long j2 = SectionPos.asLong(l1, -1, -1);
+-            LongIterator longiterator = this.sectionIds.subSet(i2, j2 + 1L).iterator();
++        // MCMT hook H2: collect the sections overlapping the query box under the monitor, then run the consumer
++        // outside it. Vanilla walked and invoked in one pass on the server thread.
++        java.util.List<EntitySection<T>> matching = new java.util.ArrayList<>();
++        synchronized (this.mcmtLock) {
++            for (int l1 = j; l1 <= i1; l1++) {
++                long i2 = SectionPos.asLong(l1, 0, 0);
++                long j2 = SectionPos.asLong(l1, -1, -1);
++                LongIterator longiterator = this.sectionIds.subSet(i2, j2 + 1L).iterator();
+ 
+-            while (longiterator.hasNext()) {
+-                long k2 = longiterator.nextLong();
+-                int l2 = SectionPos.y(k2);
+-                int i3 = SectionPos.z(k2);
+-                if (l2 >= k && l2 <= j1 && i3 >= l && i3 <= k1) {
+-                    EntitySection<T> entitysection = this.sections.get(k2);
+-                    if (entitysection != null
+-                        && !entitysection.isEmpty()
+-                        && entitysection.getStatus().isAccessible()
+-                        && p_261588_.accept(entitysection).shouldAbort()) {
+-                        return;
++                while (longiterator.hasNext()) {
++                    long k2 = longiterator.nextLong();
++                    int l2 = SectionPos.y(k2);
++                    int i3 = SectionPos.z(k2);
++                    if (l2 >= k && l2 <= j1 && i3 >= l && i3 <= k1) {
++                        EntitySection<T> entitysection = this.sections.get(k2);
++                        if (entitysection != null && !entitysection.isEmpty() && entitysection.getStatus().isAccessible()) {
++                            matching.add(entitysection);
++                        }
+                     }
+                 }
+             }
+         }
++
++        for (EntitySection<T> entitysection : matching) {
++            if (p_261588_.accept(entitysection).shouldAbort()) {
++                return;
++            }
++        }
+     }
+ 
+     public LongStream getExistingSectionPositionsInChunk(long p_156862_) {
+         int i = ChunkPos.getX(p_156862_);
+         int j = ChunkPos.getZ(p_156862_);
+-        LongSortedSet longsortedset = this.getChunkSections(i, j);
+-        if (longsortedset.isEmpty()) {
+-            return LongStream.empty();
+-        } else {
+-            OfLong oflong = longsortedset.iterator();
+-            return StreamSupport.longStream(Spliterators.spliteratorUnknownSize(oflong, 1301), false);
++        long[] snapshot;
++        synchronized (this.mcmtLock) { // MCMT hook H2: materialise the subset view before returning a stream over it
++            LongSortedSet longsortedset = this.getChunkSections(i, j);
++            if (longsortedset.isEmpty()) {
++                return LongStream.empty();
++            }
++
++            snapshot = longsortedset.toLongArray();
+         }
++
++        OfLong oflong = LongStream.of(snapshot).iterator();
++        return StreamSupport.longStream(Spliterators.spliteratorUnknownSize(oflong, 1301), false);
+     }
+ 
+     private LongSortedSet getChunkSections(int p_156859_, int p_156860_) {
+@@ -82,7 +_,7 @@
+     }
+ 
+     public Stream<EntitySection<T>> getExistingSectionsInChunk(long p_156889_) {
+-        return this.getExistingSectionPositionsInChunk(p_156889_).mapToObj(this.sections::get).filter(Objects::nonNull);
++        return this.getExistingSectionPositionsInChunk(p_156889_).mapToObj(this::getSection).filter(Objects::nonNull);
+     }
+ 
+     private static long getChunkKeyFromSectionKey(long p_156900_) {
+@@ -90,24 +_,31 @@
+     }
+ 
+     public EntitySection<T> getOrCreateSection(long p_156894_) {
+-        return this.sections.computeIfAbsent(p_156894_, this::createSection);
++        synchronized (this.mcmtLock) { // MCMT hook H2
++            return this.sections.computeIfAbsent(p_156894_, this::createSection);
++        }
+     }
+ 
+     @Nullable
+     public EntitySection<T> getSection(long p_156896_) {
+-        return this.sections.get(p_156896_);
++        synchronized (this.mcmtLock) { // MCMT hook H2
++            return this.sections.get(p_156896_);
++        }
+     }
+ 
+     private EntitySection<T> createSection(long p_156902_) {
+         long i = getChunkKeyFromSectionKey(p_156902_);
+         Visibility visibility = this.intialSectionVisibility.get(i);
+-        this.sectionIds.add(p_156902_);
++        this.sectionIds.add(p_156902_); // MCMT: runs under mcmtLock via getOrCreateSection's computeIfAbsent
+         return new EntitySection<>(this.entityClass, visibility);
+     }
+ 
+     public LongSet getAllChunksWithExistingSections() {
+         LongSet longset = new LongOpenHashSet();
+-        this.sections.keySet().forEach(p_156886_ -> longset.add(getChunkKeyFromSectionKey(p_156886_)));
++        synchronized (this.mcmtLock) { // MCMT hook H2
++            this.sections.keySet().forEach(p_156886_ -> longset.add(getChunkKeyFromSectionKey(p_156886_)));
++        }
++
+         return longset;
+     }
+ 
+@@ -120,12 +_,16 @@
+     }
+ 
+     public void remove(long p_156898_) {
+-        this.sections.remove(p_156898_);
+-        this.sectionIds.remove(p_156898_);
++        synchronized (this.mcmtLock) { // MCMT hook H2
++            this.sections.remove(p_156898_);
++            this.sectionIds.remove(p_156898_);
++        }
+     }
+ 
+     @VisibleForDebug
+     public int count() {
+-        return this.sectionIds.size();
++        synchronized (this.mcmtLock) { // MCMT hook H2
++            return this.sectionIds.size();
++        }
+     }
+ }
