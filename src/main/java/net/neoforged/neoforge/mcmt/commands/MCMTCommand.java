@@ -117,6 +117,21 @@ public final class MCMTCommand {
                     }
                 },
                 "STANDARD|OVERRIDE|REDUCTION, needs /mcmt restart"));
+        SETTINGS.put("poolMaxThreads", new Setting(
+                () -> Integer.toString(MCMTConfig.poolMaxThreads),
+                value -> {
+                    int parsed;
+                    try {
+                        parsed = Integer.parseInt(value);
+                    } catch (NumberFormatException e) {
+                        throw new IllegalArgumentException("expected a number, got '" + value + "'");
+                    }
+                    if (parsed < 0 || parsed > 1024) {
+                        throw new IllegalArgumentException("expected 0-1024, got " + parsed);
+                    }
+                    MCMTConfig.poolMaxThreads = parsed;
+                },
+                "0-1024 (0 = same as the parallelism target), needs /mcmt restart"));
     }
 
     private static final SuggestionProvider<CommandSourceStack> KEYS = (ctx, builder) -> SharedSuggestionProvider.suggest(SETTINGS.keySet(), builder);
@@ -142,8 +157,8 @@ public final class MCMTCommand {
         CommandSourceStack source = ctx.getSource();
         line(source, "MCMT", MCMTConfig.disabled ? "disabled" : "enabled");
         line(source, "Pool", MCMTThreadPool.isStarted()
-                ? MCMTThreadPool.getParallelism() + " target, " + MCMTThreadPool.getPoolSize() + " threads, "
-                        + MCMTThreadPool.getQueuedTaskCount() + " queued"
+                ? MCMTThreadPool.getParallelism() + " target, " + MCMTThreadPool.getPoolSize() + "/"
+                        + MCMTThreadPool.getMaxPoolSize() + " threads, " + MCMTThreadPool.getQueuedTaskCount() + " queued"
                 : "not started");
         line(source, "Parallel hooks", describeHooks());
         line(source, "In flight", MCMT.getRunningLevelTicks() + " level, "

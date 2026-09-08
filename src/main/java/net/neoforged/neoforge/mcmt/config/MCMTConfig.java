@@ -81,6 +81,12 @@ public final class MCMTConfig {
     /** How {@link #paraMax} is interpreted. */
     public static ParaMaxMode paraMaxMode;
 
+    /**
+     * Hard ceiling on the total worker-thread count, compensation threads included. Zero means "the same as the
+     * parallelism target". See {@link #getMaxPoolSize()}.
+     */
+    public static int poolMaxThreads;
+
     /** Disables parallel dispatch of the per-{@code ServerLevel} tick (hook H1). */
     public static boolean disableWorld;
 
@@ -135,6 +141,7 @@ public final class MCMTConfig {
         public final BooleanValue disabled;
         public final IntValue paraMax;
         public final EnumValue<ParaMaxMode> paraMaxMode;
+        public final IntValue poolMaxThreads;
         public final BooleanValue disableWorld;
         public final BooleanValue disableEntity;
         public final BooleanValue disableBlockEntity;
@@ -177,6 +184,17 @@ public final class MCMTConfig {
                             "Values below 4 are raised to 4: with fewer workers than that the per-task dispatch",
                             "cost exceeds what the parallelism buys, and MCMT is slower than being switched off.")
                     .defineInRange("paraMax", 0, 0, 256);
+            poolMaxThreads = builder
+                    .comment("Hard ceiling on the total number of worker threads, including the compensation threads",
+                            "a ForkJoinPool spawns to cover a worker that is blocked on a lock or a chunk-load wait.",
+                            "0 means 'the same as the parallelism target': the pool never grows past it, and a tick",
+                            "that has to wait for a lock simply waits, rather than the pool starting a thread to run",
+                            "other work in its place. Left uncapped this inflates badly under contention - a heavy",
+                            "world has been measured at ~1500 threads against a target of 32, which costs more in",
+                            "scheduling than the parallelism is worth. Raise this above the target only if a profile",
+                            "shows workers genuinely idle on external I/O while queued tick work goes unrun.",
+                            "Takes effect on the next pool build (/mcmt restart).")
+                    .defineInRange("poolMaxThreads", 0, 0, 1024);
             builder.pop();
 
             builder.comment("Per-hook switches. Each disables parallel dispatch for one tick loop,",
@@ -287,6 +305,24 @@ public final class MCMTConfig {
         };
     }
 
+    /**
+     * The hard ceiling on total worker threads passed to the pool as its {@code maximumPoolSize}.
+     *
+     * <p>{@link #poolMaxThreads} of zero — the default — pins this to {@link #getParallelism()} exactly: the pool
+     * is not allowed a single compensation thread, and a worker that blocks on a lock or a chunk-load wait blocks
+     * in place. That is the point. A {@code ForkJoinPool} left to compensate freely reached ~1500 threads on a
+     * heavy world against a target of 32 (see {@code TickBatch}), and every contention source found since has
+     * inflated it the same way. Whatever a blocked tick loses by waiting, it loses less than the whole server
+     * loses to scheduling a four-figure thread count.
+     *
+     * <p>A non-zero value is honoured verbatim, clamped to no less than the parallelism target and no more than
+     * 1024.
+     */
+    public static int getMaxPoolSize() {
+        int parallelism = getParallelism();
+        return poolMaxThreads <= 0 ? parallelism : Math.max(parallelism, Math.min(1024, poolMaxThreads));
+    }
+
     // Bake / save
     // -----------
 
@@ -311,6 +347,7 @@ public final class MCMTConfig {
 
         paraMax = SPEC_VALUES.paraMax.get();
         paraMaxMode = SPEC_VALUES.paraMaxMode.get();
+        poolMaxThreads = SPEC_VALUES.poolMaxThreads.get();
 
         disableWorld = SPEC_VALUES.disableWorld.get();
         disableEntity = SPEC_VALUES.disableEntity.get();
@@ -339,6 +376,7 @@ public final class MCMTConfig {
 
         SPEC_VALUES.paraMax.set(paraMax);
         SPEC_VALUES.paraMaxMode.set(paraMaxMode);
+        SPEC_VALUES.poolMaxThreads.set(poolMaxThreads);
 
         SPEC_VALUES.disableWorld.set(disableWorld);
         SPEC_VALUES.disableEntity.set(disableEntity);

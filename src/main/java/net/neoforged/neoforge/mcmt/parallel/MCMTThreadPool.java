@@ -22,6 +22,19 @@ import org.apache.logging.log4j.Logger;
  * and note that "genuinely" is the whole difference — compensating for a wait that was not going to happen is
  * what once grew this pool to 1582 threads against a target of 32.
  *
+ * <h2>The hard thread cap</h2>
+ *
+ * <p>Fixing the {@code ManagedBlocker} misuse got the worst of that back, but every contention source found
+ * since — the coarse POI monitor, the chunk-load pump, the hopper position locks — has inflated the pool the
+ * same way: a worker blocks, and a {@code join} elsewhere makes the pool compensate for it with a fresh thread.
+ * Chasing each source with a finer lock has diminishing returns. So the pool is built with an explicit
+ * {@code maximumPoolSize} — {@link MCMTConfig#getMaxPoolSize()}, by default the parallelism target itself — and a
+ * {@code saturate} predicate that returns {@code true}, meaning "at the cap, let the blocking task wait rather
+ * than throw {@code RejectedExecutionException}". Every place MCMT blocks a worker (a {@code synchronized}
+ * monitor, a {@link ManagedLock}, the {@code ServerChunkCache} pump) is released by a thread that is itself
+ * making progress and is not one of ours waiting on a pool task, so capping compensation costs parallelism
+ * during contention but cannot deadlock.
+ *
  * <p>The pool is created lazily on first use and torn down when the server stops, so a client that never starts
  * an integrated server never pays for the threads.
  */
@@ -31,6 +44,9 @@ public final class MCMTThreadPool {
     private static final AtomicInteger THREAD_ID = new AtomicInteger();
 
     private static volatile ForkJoinPool pool;
+
+    /** The {@code maximumPoolSize} the live pool was built with, for {@code /mcmt stats}. Zero when none exists. */
+    private static volatile int maxPoolSize;
 
     private MCMTThreadPool() {}
 
@@ -53,12 +69,22 @@ public final class MCMTThreadPool {
     }
 
     private static ForkJoinPool create(int parallelism) {
-        LOGGER.info("MCMT: starting tick worker pool with parallelism {}", parallelism);
+        int maxThreads = Math.max(parallelism, MCMTConfig.getMaxPoolSize());
+        maxPoolSize = maxThreads;
+        LOGGER.info("MCMT: starting tick worker pool, parallelism {}, hard thread cap {}", parallelism, maxThreads);
         return new ForkJoinPool(
                 parallelism,
                 p -> new MCMTWorkerThread(p, "MCMT-Worker-" + THREAD_ID.getAndIncrement()),
                 (thread, throwable) -> LOGGER.error("MCMT: uncaught exception on {}", thread.getName(), throwable),
-                false);
+                false,
+                parallelism,
+                maxThreads,
+                1,
+                // At the cap, run the blocking task's caller straight through rather than reject it: everything
+                // MCMT blocks a worker on is released by a thread that is itself progressing, so waiting is safe.
+                p -> true,
+                60L,
+                TimeUnit.SECONDS);
     }
 
     /** True when the calling thread is one of our workers. An {@code instanceof} check; safe on any hot path. */
@@ -80,16 +106,20 @@ public final class MCMTThreadPool {
     /**
      * Threads the pool has actually started, or zero when no pool has been created.
      *
-     * <p>Worth reporting separately from {@link #getParallelism()} because the two can diverge wildly, and when
-     * they do it is the interesting fact about the server. A {@code ForkJoinPool} adds threads beyond its
-     * parallelism target to replace workers that have blocked, so a design that blocks workers on pool-internal
-     * waits inflates without bound: an earlier revision of {@code TickBatch} reached 1582 threads against a
-     * target of 32, which cost more in scheduling than the parallelism was worth. A number here far above the
-     * target means something is blocking workers on work the pool itself still has to do.
+     * <p>Worth reporting separately from {@link #getParallelism()} because the two can diverge, and when they do
+     * it is the interesting fact about the server. A {@code ForkJoinPool} adds threads beyond its parallelism
+     * target to replace workers that have blocked; {@link #getMaxPoolSize()} is the ceiling that growth is now
+     * held to. A number sitting at the ceiling means workers are blocking often enough that the pool would grow
+     * past it if allowed — contention worth investigating, but bounded.
      */
     public static int getPoolSize() {
         ForkJoinPool p = pool;
         return p == null ? 0 : p.getPoolSize();
+    }
+
+    /** The hard ceiling on {@link #getPoolSize()} for the live pool, or zero when no pool has been created. */
+    public static int getMaxPoolSize() {
+        return pool == null ? 0 : maxPoolSize;
     }
 
     /** Tasks submitted but not yet finished, or zero when no pool has been created. */
@@ -115,6 +145,7 @@ public final class MCMTThreadPool {
             return;
         }
         pool = null;
+        maxPoolSize = 0;
         p.shutdown();
         try {
             if (!p.awaitTermination(5, TimeUnit.SECONDS)) {
