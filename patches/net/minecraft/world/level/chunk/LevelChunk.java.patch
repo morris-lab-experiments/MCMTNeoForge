@@ -1,5 +1,19 @@
 --- a/net/minecraft/world/level/chunk/LevelChunk.java
 +++ b/net/minecraft/world/level/chunk/LevelChunk.java
+@@ -100,7 +_,12 @@
+     ) {
+         super(p_196855_, p_196856_, p_196854_, p_196854_.registryAccess().registryOrThrow(Registries.BIOME), p_196859_, p_196860_, p_196862_);
+         this.level = p_196854_;
+-        this.gameEventListenerRegistrySections = new Int2ObjectOpenHashMap<>();
++        // MCMT: getListenerRegistry(int) does computeIfAbsent on this map, and under MCMT it is called
++        // concurrently by workers posting game events (movement, fall damage, ...) in freshly loaded chunk
++        // sections. A plain Int2ObjectOpenHashMap corrupts mid-rehash there and computeIfAbsent can return null
++        // -> NPE in GameEventDispatcher.post. The synchronized wrapper makes computeIfAbsent/remove atomic; the
++        // mapping function just constructs a EuclideanGameEventListenerRegistry (no callback into this map).
++        this.gameEventListenerRegistrySections = it.unimi.dsi.fastutil.ints.Int2ObjectMaps.synchronize(new Int2ObjectOpenHashMap<>());
+ 
+         for (Heightmap.Types heightmap$types : Heightmap.Types.values()) {
+             if (ChunkStatus.FULL.heightmapsAfter().contains(heightmap$types)) {
 @@ -139,6 +_,7 @@
          this.setAllStarts(p_196851_.getAllStarts());
          this.setAllReferences(p_196851_.getAllReferences());

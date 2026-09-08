@@ -1,15 +1,107 @@
 --- a/net/minecraft/world/level/chunk/storage/SectionStorage.java
 +++ b/net/minecraft/world/level/chunk/storage/SectionStorage.java
-@@ -238,4 +_,12 @@
+@@ -31,6 +_,17 @@
+ import net.minecraft.world.level.LevelHeightAccessor;
+ import org.slf4j.Logger;
+ 
++/**
++ * MCMT: every method that touches {@link #storage} or {@link #dirty} is {@code synchronized} on {@code this}.
++ * Under MCMT the one live subclass, {@link net.minecraft.world.entity.ai.village.poi.PoiManager}, is hit
++ * concurrently: worker threads run villager/piglin/bee brain AI (POI queries and edits) while another worker
++ * runs the H1 {@code ChunkMap.tick -> PoiManager.tick} and chunk-load workers deserialize POI data. A plain
++ * {@code Long2ObjectOpenHashMap} / {@code LongLinkedOpenHashSet} corrupts mid-rehash there -- observed as a
++ * fatal crash in {@code SectionStorage.readColumn} and {@code PoiManager$DistanceTracker.runAllUpdates}
++ * (MCMT-PLAN §4i). The monitor is always taken alone; the only method that calls out to code which can take
++ * another MCMT lock is {@code PoiManager.ensureLoadedAndValid}, which drops the monitor before loading chunks.
++ * Vanilla runs all of this on the server thread, so serialising it is no worse than MCMT-off.
++ */
+ public class SectionStorage<R> implements AutoCloseable {
+     private static final Logger LOGGER = LogUtils.getLogger();
+     private static final String SECTIONS_TAG = "Sections";
+@@ -59,23 +_,23 @@
+         this.levelHeightAccessor = p_223516_;
+     }
+ 
+-    protected void tick(BooleanSupplier p_63812_) {
++    protected synchronized void tick(BooleanSupplier p_63812_) { // MCMT: synchronized
+         while (this.hasWork() && p_63812_.getAsBoolean()) {
+             ChunkPos chunkpos = SectionPos.of(this.dirty.firstLong()).chunk();
+             this.writeColumn(chunkpos);
+         }
+     }
+ 
+-    public boolean hasWork() {
++    public synchronized boolean hasWork() { // MCMT: synchronized
+         return !this.dirty.isEmpty();
+     }
+ 
+     @Nullable
+-    protected Optional<R> get(long p_63819_) {
++    protected synchronized Optional<R> get(long p_63819_) { // MCMT: synchronized
+         return this.storage.get(p_63819_);
+     }
+ 
+-    protected Optional<R> getOrLoad(long p_63824_) {
++    protected synchronized Optional<R> getOrLoad(long p_63824_) { // MCMT: synchronized (may block on POI region IO)
+         if (this.outsideStoredRange(p_63824_)) {
+             return Optional.empty();
+         } else {
+@@ -99,7 +_,7 @@
+         return this.levelHeightAccessor.isOutsideBuildHeight(i);
+     }
+ 
+-    protected R getOrCreate(long p_63828_) {
++    protected synchronized R getOrCreate(long p_63828_) { // MCMT: synchronized
+         if (this.outsideStoredRange(p_63828_)) {
+             throw (IllegalArgumentException)Util.pauseInIde(new IllegalArgumentException("sectionPos out of bounds"));
+         } else {
+@@ -114,7 +_,7 @@
+         }
+     }
+ 
+-    private void readColumn(ChunkPos p_63815_) {
++    private synchronized void readColumn(ChunkPos p_63815_) { // MCMT: synchronized
+         Optional<CompoundTag> optional = this.tryRead(p_63815_).join();
+         RegistryOps<Tag> registryops = this.registryAccess.createSerializationContext(NbtOps.INSTANCE);
+         this.readColumn(p_63815_, registryops, optional.orElse(null));
+@@ -161,7 +_,7 @@
+         }
+     }
+ 
+-    private void writeColumn(ChunkPos p_63826_) {
++    private synchronized void writeColumn(ChunkPos p_63826_) { // MCMT: synchronized
+         RegistryOps<Tag> registryops = this.registryAccess.createSerializationContext(NbtOps.INSTANCE);
+         Dynamic<Tag> dynamic = this.writeColumn(p_63826_, registryops);
+         Tag tag = dynamic.getValue();
+@@ -209,7 +_,7 @@
+     protected void onSectionLoad(long p_63813_) {
+     }
+ 
+-    protected void setDirty(long p_63788_) {
++    protected synchronized void setDirty(long p_63788_) { // MCMT: synchronized
+         Optional<R> optional = this.storage.get(p_63788_);
+         if (optional != null && !optional.isEmpty()) {
+             this.dirty.add(p_63788_);
+@@ -222,7 +_,7 @@
+         return p_63806_.get("DataVersion").asInt(1945);
+     }
+ 
+-    public void flush(ChunkPos p_63797_) {
++    public synchronized void flush(ChunkPos p_63797_) { // MCMT: synchronized
+         if (this.hasWork()) {
+             for (int i = this.levelHeightAccessor.getMinSection(); i < this.levelHeightAccessor.getMaxSection(); i++) {
+                 long j = getKey(p_63797_, i);
+@@ -237,5 +_,13 @@
+     @Override
      public void close() throws IOException {
          this.simpleRegionStorage.close();
-     }
++    }
 +
 +    /**
 +     * Neo: Removes the data for the given chunk position.
 +     * See PR #937
 +     */
-+    public void remove(long sectionPosAsLong) {
++    public synchronized void remove(long sectionPosAsLong) { // MCMT: synchronized
 +        this.storage.remove(sectionPosAsLong);
-+    }
+     }
  }

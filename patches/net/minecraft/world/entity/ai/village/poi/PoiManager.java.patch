@@ -1,0 +1,175 @@
+--- a/net/minecraft/world/entity/ai/village/poi/PoiManager.java
++++ b/net/minecraft/world/entity/ai/village/poi/PoiManager.java
+@@ -64,11 +_,11 @@
+         this.distanceTracker = new PoiManager.DistanceTracker();
+     }
+ 
+-    public void add(BlockPos p_217920_, Holder<PoiType> p_217921_) {
++    public synchronized void add(BlockPos p_217920_, Holder<PoiType> p_217921_) { // MCMT: synchronized
+         this.getOrCreate(SectionPos.asLong(p_217920_)).add(p_217920_, p_217921_);
+     }
+ 
+-    public void remove(BlockPos p_27080_) {
++    public synchronized void remove(BlockPos p_27080_) { // MCMT: synchronized
+         this.getOrLoad(SectionPos.asLong(p_27080_)).ifPresent(p_148657_ -> p_148657_.remove(p_27080_));
+     }
+ 
+@@ -76,7 +_,7 @@
+         return this.getInRange(p_27122_, p_27123_, p_27124_, p_27125_).count();
+     }
+ 
+-    public boolean existsAtPosition(ResourceKey<PoiType> p_217875_, BlockPos p_217876_) {
++    public synchronized boolean existsAtPosition(ResourceKey<PoiType> p_217875_, BlockPos p_217876_) { // MCMT: synchronized
+         return this.exists(p_217876_, p_217879_ -> p_217879_.is(p_217875_));
+     }
+ 
+@@ -95,11 +_,21 @@
+ 
+     @VisibleForDebug
+     public Stream<PoiRecord> getInChunk(Predicate<Holder<PoiType>> p_27118_, ChunkPos p_27119_, PoiManager.Occupancy p_27120_) {
+-        return IntStream.range(this.levelHeightAccessor.getMinSection(), this.levelHeightAccessor.getMaxSection())
+-            .boxed()
+-            .map(p_217886_ -> this.getOrLoad(SectionPos.of(p_27119_, p_217886_).asLong()))
+-            .filter(Optional::isPresent)
+-            .flatMap(p_217942_ -> p_217942_.get().getRecords(p_27118_, p_27120_));
++        // MCMT: the section maps and each PoiSection's record maps are read here and mutated (with the same
++        // monitor) by add/remove/checkConsistencyWithBlocks -- so materialise the whole per-chunk result under
++        // the lock. The higher-level getInSquare / getInRange / findClosest chains then filter an in-memory list
++        // and never touch a fastutil map off-thread. See MCMT-PLAN §4i.
++        List<PoiRecord> list;
++        synchronized (this) {
++            list = IntStream.range(this.levelHeightAccessor.getMinSection(), this.levelHeightAccessor.getMaxSection())
++                .boxed()
++                .map(p_217886_ -> this.getOrLoad(SectionPos.of(p_27119_, p_217886_).asLong()))
++                .filter(Optional::isPresent)
++                .flatMap(p_217942_ -> p_217942_.get().getRecords(p_27118_, p_27120_))
++                .collect(java.util.stream.Collectors.toList());
++        }
++
++        return list.stream();
+     }
+ 
+     public Stream<BlockPos> findAll(
+@@ -152,7 +_,9 @@
+             .min(Comparator.comparingDouble(p_217918_ -> p_217918_.distSqr(p_148661_)));
+     }
+ 
+-    public Optional<BlockPos> take(Predicate<Holder<PoiType>> p_217947_, BiPredicate<Holder<PoiType>, BlockPos> p_217948_, BlockPos p_217949_, int p_217950_) {
++    public synchronized Optional<BlockPos> take( // MCMT: synchronized (mutates ticket counts)
++        Predicate<Holder<PoiType>> p_217947_, BiPredicate<Holder<PoiType>, BlockPos> p_217948_, BlockPos p_217949_, int p_217950_
++    ) {
+         return this.getInRange(p_217947_, p_217949_, p_217950_, PoiManager.Occupancy.HAS_SPACE)
+             .filter(p_217934_ -> p_217948_.test(p_217934_.getPoiType(), p_217934_.getPos()))
+             .findFirst()
+@@ -162,7 +_,7 @@
+             });
+     }
+ 
+-    public Optional<BlockPos> getRandom(
++    public synchronized Optional<BlockPos> getRandom( // MCMT: synchronized
+         Predicate<Holder<PoiType>> p_217952_,
+         Predicate<BlockPos> p_217953_,
+         PoiManager.Occupancy p_217954_,
+@@ -174,32 +_,32 @@
+         return list.stream().filter(p_217945_ -> p_217953_.test(p_217945_.getPos())).findFirst().map(PoiRecord::getPos);
+     }
+ 
+-    public boolean release(BlockPos p_27155_) {
++    public synchronized boolean release(BlockPos p_27155_) { // MCMT: synchronized
+         return this.getOrLoad(SectionPos.asLong(p_27155_))
+             .map(p_217993_ -> p_217993_.release(p_27155_))
+             .orElseThrow(() -> Util.pauseInIde(new IllegalStateException("POI never registered at " + p_27155_)));
+     }
+ 
+-    public boolean exists(BlockPos p_27092_, Predicate<Holder<PoiType>> p_27093_) {
++    public synchronized boolean exists(BlockPos p_27092_, Predicate<Holder<PoiType>> p_27093_) { // MCMT: synchronized
+         return this.getOrLoad(SectionPos.asLong(p_27092_)).map(p_217925_ -> p_217925_.exists(p_27092_, p_27093_)).orElse(false);
+     }
+ 
+-    public Optional<Holder<PoiType>> getType(BlockPos p_27178_) {
++    public synchronized Optional<Holder<PoiType>> getType(BlockPos p_27178_) { // MCMT: synchronized
+         return this.getOrLoad(SectionPos.asLong(p_27178_)).flatMap(p_217974_ -> p_217974_.getType(p_27178_));
+     }
+ 
+     @Deprecated
+     @VisibleForDebug
+-    public int getFreeTickets(BlockPos p_148654_) {
++    public synchronized int getFreeTickets(BlockPos p_148654_) { // MCMT: synchronized
+         return this.getOrLoad(SectionPos.asLong(p_148654_)).map(p_217912_ -> p_217912_.getFreeTickets(p_148654_)).orElse(0);
+     }
+ 
+-    public int sectionsToVillage(SectionPos p_27099_) {
++    public synchronized int sectionsToVillage(SectionPos p_27099_) { // MCMT: synchronized (distanceTracker)
+         this.distanceTracker.runAllUpdates();
+         return this.distanceTracker.getLevel(p_27099_.asLong());
+     }
+ 
+-    boolean isVillageCenter(long p_27198_) {
++    synchronized boolean isVillageCenter(long p_27198_) { // MCMT: synchronized
+         Optional<PoiSection> optional = this.get(p_27198_);
+         return optional == null
+             ? false
+@@ -210,23 +_,23 @@
+     }
+ 
+     @Override
+-    public void tick(BooleanSupplier p_27105_) {
++    public synchronized void tick(BooleanSupplier p_27105_) { // MCMT: synchronized
+         super.tick(p_27105_);
+         this.distanceTracker.runAllUpdates();
+     }
+ 
+     @Override
+-    protected void setDirty(long p_27036_) {
++    protected synchronized void setDirty(long p_27036_) { // MCMT: synchronized
+         super.setDirty(p_27036_);
+         this.distanceTracker.update(p_27036_, this.distanceTracker.getLevelFromSource(p_27036_), false);
+     }
+ 
+     @Override
+-    protected void onSectionLoad(long p_27145_) {
++    protected synchronized void onSectionLoad(long p_27145_) { // MCMT: synchronized
+         this.distanceTracker.update(p_27145_, this.distanceTracker.getLevelFromSource(p_27145_), false);
+     }
+ 
+-    public void checkConsistencyWithBlocks(SectionPos p_281731_, LevelChunkSection p_281893_) {
++    public synchronized void checkConsistencyWithBlocks(SectionPos p_281731_, LevelChunkSection p_281893_) { // MCMT: synchronized
+         Util.ifElse(this.getOrLoad(p_281731_.asLong()), p_217898_ -> p_217898_.refresh(p_217967_ -> {
+                 if (mayHavePoi(p_281893_)) {
+                     this.updateFromSection(p_281893_, p_281731_, p_217967_);
+@@ -258,16 +_,27 @@
+     }
+ 
+     public void ensureLoadedAndValid(LevelReader p_27057_, BlockPos p_27058_, int p_27059_) {
+-        SectionPos.aroundChunk(
+-                new ChunkPos(p_27058_), Math.floorDiv(p_27059_, 16), this.levelHeightAccessor.getMinSection(), this.levelHeightAccessor.getMaxSection()
+-            )
+-            .map(p_217979_ -> Pair.of(p_217979_, this.getOrLoad(p_217979_.asLong())))
+-            .filter(p_217963_ -> !p_217963_.getSecond().map(PoiSection::isValid).orElse(false))
+-            .map(p_217891_ -> p_217891_.getFirst().chunk())
+-            .filter(p_217961_ -> this.loadedChunks.add(p_217961_.toLong()))
+-            .forEach(p_330057_ -> p_27057_.getChunk(p_330057_.x, p_330057_.z, ChunkStatus.EMPTY));
++        // MCMT: pick the chunks under the monitor, then load them without it. getChunk can take
++        // mcmtChunkLoadLock, and holding this monitor across it would invert lock order against the chunk-load
++        // pump, which calls checkConsistencyWithBlocks (this monitor) while holding mcmtChunkLoadLock. See §4i.
++        List<ChunkPos> toload;
++        synchronized (this) {
++            toload = SectionPos.aroundChunk(
++                    new ChunkPos(p_27058_), Math.floorDiv(p_27059_, 16), this.levelHeightAccessor.getMinSection(), this.levelHeightAccessor.getMaxSection()
++                )
++                .map(p_217979_ -> Pair.of(p_217979_, this.getOrLoad(p_217979_.asLong())))
++                .filter(p_217963_ -> !p_217963_.getSecond().map(PoiSection::isValid).orElse(false))
++                .map(p_217891_ -> p_217891_.getFirst().chunk())
++                .filter(p_217961_ -> this.loadedChunks.add(p_217961_.toLong()))
++                .collect(java.util.stream.Collectors.toList());
++        }
++
++        toload.forEach(p_330057_ -> p_27057_.getChunk(p_330057_.x, p_330057_.z, ChunkStatus.EMPTY));
+     }
+ 
++    // MCMT: not independently locked. Every entry point (runAllUpdates via tick / sectionsToVillage, update via
++    // setDirty / onSectionLoad) is a synchronized PoiManager method, so its Long2ByteOpenHashMap and the
++    // SectionTracker queues are only ever touched under the PoiManager monitor. See MCMT-PLAN §4i.
+     final class DistanceTracker extends SectionTracker {
+         private final Long2ByteMap levels = new Long2ByteOpenHashMap();
+ 
