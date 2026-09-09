@@ -1,6 +1,6 @@
 --- a/net/minecraft/server/level/ServerChunkCache.java
 +++ b/net/minecraft/server/level/ServerChunkCache.java
-@@ -58,9 +_,20 @@
+@@ -58,9 +_,31 @@
      private boolean spawnEnemies = true;
      private boolean spawnFriendlies = true;
      private static final int CACHE_SIZE = 4;
@@ -12,6 +12,17 @@
 +    // whose chunk has already been replaced and come away with the wrong chunk. See ChunkCacheEntry.
 +    private final java.util.concurrent.atomic.AtomicReferenceArray<net.neoforged.neoforge.mcmt.parallel.ChunkCacheEntry> lastChunks = new java.util.concurrent.atomic.AtomicReferenceArray<>(
 +        4
++    );
++    // MCMT hook: the shared cache above has four slots. Under MCMT, 32 workers evict each other's entries on
++    // every miss, so it almost never hits and nearly every getChunk falls through to mcmtChunkLoadLock -- a
++    // 32-worker jstack put about 72% of engaged worker time on that lock. Give each pool worker its own slots
++    // instead, so its own working set stays cached and a hit skips the lock entirely. An entry is valid until
++    // the next clearCache(), exactly as a shared-cache entry is: clearCache() bumps mcmtCacheVersion, and an
++    // entry records the version it was stored at. Only FULL chunks are cached, and only for pool threads --
++    // the server thread keeps the shared cache, which suits it because it is single-threaded.
++    private final java.util.concurrent.atomic.AtomicLong mcmtCacheVersion = new java.util.concurrent.atomic.AtomicLong();
++    private final ThreadLocal<net.neoforged.neoforge.mcmt.parallel.ThreadChunkCache> mcmtLocalChunkCache = ThreadLocal.withInitial(
++        net.neoforged.neoforge.mcmt.parallel.ThreadChunkCache::new
 +    );
 +
 +    // MCMT hook: serialises mutation of the chunk map on the cache-miss path. getChunkFutureMainThread walks
@@ -105,7 +116,7 @@
      @Nullable
      private ChunkHolder getVisibleChunkIfPresent(long p_8365_) {
          return this.chunkMap.getVisibleChunkIfPresent(p_8365_);
-@@ -121,20 +_,16 @@
+@@ -121,44 +_,94 @@
  
      private void storeInCache(long p_8367_, @Nullable ChunkAccess p_8368_, ChunkStatus p_331839_) {
          for (int i = 3; i > 0; i--) {
@@ -129,9 +140,24 @@
              return CompletableFuture.<ChunkAccess>supplyAsync(() -> this.getChunk(p_8360_, p_8361_, p_330876_, p_8363_), this.mainThreadProcessor).join();
          } else {
              ProfilerFiller profilerfiller = this.level.getProfiler();
-@@ -142,22 +_,57 @@
+             profilerfiller.incrementCounter("getChunk");
              long i = ChunkPos.asLong(p_8360_, p_8361_);
  
++            // MCMT hook: per-worker cache lookup, ahead of the shared cache. A FULL chunk cannot be unloaded
++            // or downgraded during a parallel tick phase -- only ServerChunkCache.tick()'s processUnloads
++            // does that, on the server thread between phases, and it always calls clearCache() afterwards --
++            // so a version-matched hit is safe to return without taking mcmtChunkLoadLock.
++            net.neoforged.neoforge.mcmt.parallel.ThreadChunkCache mcmtLocal = net.neoforged.neoforge.mcmt.MCMT.isPoolThread()
++                ? this.mcmtLocalChunkCache.get()
++                : null;
++            long mcmtVersion = mcmtLocal == null ? 0L : this.mcmtCacheVersion.get();
++            if (mcmtLocal != null) {
++                ChunkAccess mcmtHit = mcmtLocal.get(i, p_330876_, mcmtVersion);
++                if (mcmtHit != null) {
++                    return mcmtHit;
++                }
++            }
++
              for (int j = 0; j < 4; j++) {
 -                if (i == this.lastChunkPos[j] && p_330876_ == this.lastChunkStatus[j]) {
 -                    ChunkAccess chunkaccess = this.lastChunk[j];
@@ -189,8 +215,13 @@
 +                // storeInCache can only duplicate or drop a whole entry (a later cache miss, at worst), never
 +                // publish a torn one. Not worth a lock hold on this hot path.
                  this.storeInCache(i, chunkaccess1, p_330876_);
++                if (mcmtLocal != null) {
++                    mcmtLocal.put(i, p_330876_, chunkaccess1, mcmtVersion);
++                }
++
                  return chunkaccess1;
              }
+         }
 @@ -167,15 +_,16 @@
      @Nullable
      @Override
@@ -219,7 +250,7 @@
                  ChunkAccess chunkaccess1 = chunkholder.getChunkIfPresent(ChunkStatus.FULL);
                  if (chunkaccess1 != null) {
                      this.storeInCache(i, chunkaccess1, ChunkStatus.FULL);
-@@ -198,17 +_,26 @@
+@@ -198,17 +_,28 @@
      }
  
      private void clearCache() {
@@ -229,6 +260,8 @@
 +        for (int i = 0; i < 4; i++) {
 +            this.lastChunks.set(i, null);
 +        }
++
++        this.mcmtCacheVersion.incrementAndGet(); // MCMT: drop every worker's per-thread chunk cache
      }
  
      public CompletableFuture<ChunkResult<ChunkAccess>> getChunkFuture(int p_8432_, int p_8433_, ChunkStatus p_330326_, boolean p_8435_) {
