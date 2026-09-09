@@ -1,97 +1,277 @@
 --- a/net/minecraft/world/level/chunk/storage/SectionStorage.java
 +++ b/net/minecraft/world/level/chunk/storage/SectionStorage.java
-@@ -31,6 +_,17 @@
+@@ -31,12 +_,33 @@
  import net.minecraft.world.level.LevelHeightAccessor;
  import org.slf4j.Logger;
  
 +/**
-+ * MCMT: every method that touches {@link #storage} or {@link #dirty} is {@code synchronized} on {@code this}.
-+ * Under MCMT the one live subclass, {@link net.minecraft.world.entity.ai.village.poi.PoiManager}, is hit
-+ * concurrently: worker threads run villager/piglin/bee brain AI (POI queries and edits) while another worker
-+ * runs the H1 {@code ChunkMap.tick -> PoiManager.tick} and chunk-load workers deserialize POI data. A plain
++ * MCMT: {@code storage}, {@code dirty} and (in {@link net.minecraft.world.entity.ai.village.poi.PoiManager})
++ * each {@code PoiSection}'s record maps plus the {@code DistanceTracker} are guarded by one
++ * {@link java.util.concurrent.locks.ReentrantReadWriteLock} per level, {@link #mcmtLock}. Under MCMT the one
++ * live subclass, {@code PoiManager}, is hit concurrently: many workers run villager/piglin/bee brain AI (POI
++ * reads -- {@code exists}, {@code getType}, {@code getInChunk}, {@code sectionsToVillage}) while writes
++ * (add/remove/take/release, the H1 {@code PoiManager.tick}, chunk-load deserialization) mutate the maps. A plain
 + * {@code Long2ObjectOpenHashMap} / {@code LongLinkedOpenHashSet} corrupts mid-rehash there -- observed as a
 + * fatal crash in {@code SectionStorage.readColumn} and {@code PoiManager$DistanceTracker.runAllUpdates}
-+ * (MCMT-PLAN §4i). The monitor is always taken alone; the only method that calls out to code which can take
-+ * another MCMT lock is {@code PoiManager.ensureLoadedAndValid}, which drops the monitor before loading chunks.
-+ * Vanilla runs all of this on the server thread, so serialising it is no worse than MCMT-off.
++ * (MCMT-PLAN §4i/§4j). A coarse monitor fixed the crash but funnelled every villager's POI reads through one
++ * lock (~20% of worker samples blocked, MCMT-PLAN §4m); the read/write split lets resident reads run
++ * concurrently and takes the write lock only for mutations and section loads.
++ *
++ * <p>The lock is reentrant, so a write path may call a read helper. The one rule: a read path must not hold
++ * the read lock across {@link #getOrLoad}, which escalates to the write lock on a cache miss (a read lock
++ * cannot upgrade). {@code getInChunk} / {@code exists} / {@code getType} / {@code getFreeTickets} resolve
++ * sections through {@code getOrLoad} first, then take the read lock. {@code PoiManager.ensureLoadedAndValid}
++ * still drops the lock before loading chunks, to keep lock order against the chunk-load pump. See MCMT-PLAN §4n.
 + */
  public class SectionStorage<R> implements AutoCloseable {
      private static final Logger LOGGER = LogUtils.getLogger();
      private static final String SECTIONS_TAG = "Sections";
-@@ -59,23 +_,23 @@
+     private final SimpleRegionStorage simpleRegionStorage;
+     private final Long2ObjectMap<Optional<R>> storage = new Long2ObjectOpenHashMap<>();
+     private final LongLinkedOpenHashSet dirty = new LongLinkedOpenHashSet();
++    // MCMT: guards storage / dirty / each PoiSection's maps / the DistanceTracker. See the class javadoc.
++    protected final java.util.concurrent.locks.ReentrantReadWriteLock mcmtLock = new java.util.concurrent.locks.ReentrantReadWriteLock();
+     private final Function<Runnable, Codec<R>> codec;
+     private final Function<Runnable, R> factory;
+     private final RegistryAccess registryAccess;
+@@ -59,38 +_,77 @@
          this.levelHeightAccessor = p_223516_;
      }
  
 -    protected void tick(BooleanSupplier p_63812_) {
-+    protected synchronized void tick(BooleanSupplier p_63812_) { // MCMT: synchronized
-         while (this.hasWork() && p_63812_.getAsBoolean()) {
-             ChunkPos chunkpos = SectionPos.of(this.dirty.firstLong()).chunk();
-             this.writeColumn(chunkpos);
+-        while (this.hasWork() && p_63812_.getAsBoolean()) {
+-            ChunkPos chunkpos = SectionPos.of(this.dirty.firstLong()).chunk();
+-            this.writeColumn(chunkpos);
+-        }
+-    }
+-
+-    public boolean hasWork() {
+-        return !this.dirty.isEmpty();
+-    }
+-
+-    @Nullable
+-    protected Optional<R> get(long p_63819_) {
+-        return this.storage.get(p_63819_);
+-    }
+-
+-    protected Optional<R> getOrLoad(long p_63824_) {
++    protected void tick(BooleanSupplier p_63812_) { // MCMT: write lock
++        this.mcmtLock.writeLock().lock();
++        try {
++            while (this.hasWork() && p_63812_.getAsBoolean()) {
++                ChunkPos chunkpos = SectionPos.of(this.dirty.firstLong()).chunk();
++                this.writeColumn(chunkpos);
++            }
++        } finally {
++            this.mcmtLock.writeLock().unlock();
++        }
++    }
++
++    public boolean hasWork() { // MCMT: read lock
++        this.mcmtLock.readLock().lock();
++        try {
++            return !this.dirty.isEmpty();
++        } finally {
++            this.mcmtLock.readLock().unlock();
++        }
++    }
++
++    @Nullable
++    protected Optional<R> get(long p_63819_) { // MCMT: read lock
++        this.mcmtLock.readLock().lock();
++        try {
++            return this.storage.get(p_63819_);
++        } finally {
++            this.mcmtLock.readLock().unlock();
++        }
++    }
++
++    /**
++     * MCMT: returns the resident section for the key, or {@code null} if the column was never read. The caller
++     * must already hold {@link #mcmtLock} (read or write). Unlike {@link #get}, this takes no lock, so a caller
++     * that reads several sections under one lock acquire pays the {@link java.util.concurrent.locks.ReentrantReadWriteLock}
++     * acquire cost once rather than once per section. See MCMT-PLAN §4n.
++     */
++    @Nullable
++    protected Optional<R> getWhileLocked(long p_mcmt_) {
++        return this.storage.get(p_mcmt_);
++    }
++
++    protected Optional<R> getOrLoad(long p_63824_) { // MCMT: read-lock fast path, write-lock load (may block on POI region IO)
+         if (this.outsideStoredRange(p_63824_)) {
+             return Optional.empty();
+-        } else {
+-            Optional<R> optional = this.get(p_63824_);
+-            if (optional != null) {
+-                return optional;
+-            } else {
+-                this.readColumn(SectionPos.of(p_63824_).chunk());
+-                optional = this.get(p_63824_);
+-                if (optional == null) {
+-                    throw (IllegalStateException)Util.pauseInIde(new IllegalStateException());
+-                } else {
+-                    return optional;
+-                }
+-            }
++        }
++
++        this.mcmtLock.readLock().lock();
++        try {
++            Optional<R> optional = this.storage.get(p_63824_);
++            if (optional != null) {
++                return optional;
++            }
++        } finally {
++            this.mcmtLock.readLock().unlock();
++        }
++
++        this.mcmtLock.writeLock().lock();
++        try {
++            Optional<R> optional = this.storage.get(p_63824_);
++            if (optional != null) {
++                return optional;
++            }
++            this.readColumn(SectionPos.of(p_63824_).chunk());
++            optional = this.storage.get(p_63824_);
++            if (optional == null) {
++                throw (IllegalStateException)Util.pauseInIde(new IllegalStateException());
++            }
++            return optional;
++        } finally {
++            this.mcmtLock.writeLock().unlock();
          }
      }
  
--    public boolean hasWork() {
-+    public synchronized boolean hasWork() { // MCMT: synchronized
-         return !this.dirty.isEmpty();
-     }
- 
-     @Nullable
--    protected Optional<R> get(long p_63819_) {
-+    protected synchronized Optional<R> get(long p_63819_) { // MCMT: synchronized
-         return this.storage.get(p_63819_);
-     }
- 
--    protected Optional<R> getOrLoad(long p_63824_) {
-+    protected synchronized Optional<R> getOrLoad(long p_63824_) { // MCMT: synchronized (may block on POI region IO)
-         if (this.outsideStoredRange(p_63824_)) {
-             return Optional.empty();
-         } else {
-@@ -99,7 +_,7 @@
+@@ -99,25 +_,33 @@
          return this.levelHeightAccessor.isOutsideBuildHeight(i);
      }
  
 -    protected R getOrCreate(long p_63828_) {
-+    protected synchronized R getOrCreate(long p_63828_) { // MCMT: synchronized
++    protected R getOrCreate(long p_63828_) { // MCMT: write lock
          if (this.outsideStoredRange(p_63828_)) {
              throw (IllegalArgumentException)Util.pauseInIde(new IllegalArgumentException("sectionPos out of bounds"));
-         } else {
-@@ -114,7 +_,7 @@
+-        } else {
++        }
++        this.mcmtLock.writeLock().lock();
++        try {
+             Optional<R> optional = this.getOrLoad(p_63828_);
+             if (optional.isPresent()) {
+                 return optional.get();
+-            } else {
+-                R r = this.factory.apply(() -> this.setDirty(p_63828_));
+-                this.storage.put(p_63828_, Optional.of(r));
+-                return r;
+             }
++            R r = this.factory.apply(() -> this.setDirty(p_63828_));
++            this.storage.put(p_63828_, Optional.of(r));
++            return r;
++        } finally {
++            this.mcmtLock.writeLock().unlock();
          }
      }
  
 -    private void readColumn(ChunkPos p_63815_) {
-+    private synchronized void readColumn(ChunkPos p_63815_) { // MCMT: synchronized
-         Optional<CompoundTag> optional = this.tryRead(p_63815_).join();
-         RegistryOps<Tag> registryops = this.registryAccess.createSerializationContext(NbtOps.INSTANCE);
-         this.readColumn(p_63815_, registryops, optional.orElse(null));
-@@ -161,7 +_,7 @@
+-        Optional<CompoundTag> optional = this.tryRead(p_63815_).join();
+-        RegistryOps<Tag> registryops = this.registryAccess.createSerializationContext(NbtOps.INSTANCE);
+-        this.readColumn(p_63815_, registryops, optional.orElse(null));
++    private void readColumn(ChunkPos p_63815_) { // MCMT: write lock (reentrant; only reached from getOrLoad's load path)
++        this.mcmtLock.writeLock().lock();
++        try {
++            Optional<CompoundTag> optional = this.tryRead(p_63815_).join();
++            RegistryOps<Tag> registryops = this.registryAccess.createSerializationContext(NbtOps.INSTANCE);
++            this.readColumn(p_63815_, registryops, optional.orElse(null));
++        } finally {
++            this.mcmtLock.writeLock().unlock();
++        }
+     }
+ 
+     private CompletableFuture<Optional<CompoundTag>> tryRead(ChunkPos p_223533_) {
+@@ -161,17 +_,22 @@
          }
      }
  
 -    private void writeColumn(ChunkPos p_63826_) {
-+    private synchronized void writeColumn(ChunkPos p_63826_) { // MCMT: synchronized
-         RegistryOps<Tag> registryops = this.registryAccess.createSerializationContext(NbtOps.INSTANCE);
-         Dynamic<Tag> dynamic = this.writeColumn(p_63826_, registryops);
-         Tag tag = dynamic.getValue();
-@@ -209,7 +_,7 @@
+-        RegistryOps<Tag> registryops = this.registryAccess.createSerializationContext(NbtOps.INSTANCE);
+-        Dynamic<Tag> dynamic = this.writeColumn(p_63826_, registryops);
+-        Tag tag = dynamic.getValue();
+-        if (tag instanceof CompoundTag) {
+-            this.simpleRegionStorage.write(p_63826_, (CompoundTag)tag).exceptionally(p_351992_ -> {
+-                this.errorReporter.reportChunkSaveFailure(p_351992_, this.simpleRegionStorage.storageInfo(), p_63826_);
+-                return null;
+-            });
+-        } else {
+-            LOGGER.error("Expected compound tag, got {}", tag);
++    private void writeColumn(ChunkPos p_63826_) { // MCMT: write lock (reentrant; reached from tick / flush)
++        this.mcmtLock.writeLock().lock();
++        try {
++            RegistryOps<Tag> registryops = this.registryAccess.createSerializationContext(NbtOps.INSTANCE);
++            Dynamic<Tag> dynamic = this.writeColumn(p_63826_, registryops);
++            Tag tag = dynamic.getValue();
++            if (tag instanceof CompoundTag) {
++                this.simpleRegionStorage.write(p_63826_, (CompoundTag)tag).exceptionally(p_351992_ -> {
++                    this.errorReporter.reportChunkSaveFailure(p_351992_, this.simpleRegionStorage.storageInfo(), p_63826_);
++                    return null;
++                });
++            } else {
++                LOGGER.error("Expected compound tag, got {}", tag);
++            }
++        } finally {
++            this.mcmtLock.writeLock().unlock();
+         }
+     }
+ 
+@@ -209,12 +_,17 @@
      protected void onSectionLoad(long p_63813_) {
      }
  
 -    protected void setDirty(long p_63788_) {
-+    protected synchronized void setDirty(long p_63788_) { // MCMT: synchronized
-         Optional<R> optional = this.storage.get(p_63788_);
-         if (optional != null && !optional.isEmpty()) {
-             this.dirty.add(p_63788_);
-@@ -222,7 +_,7 @@
+-        Optional<R> optional = this.storage.get(p_63788_);
+-        if (optional != null && !optional.isEmpty()) {
+-            this.dirty.add(p_63788_);
+-        } else {
+-            LOGGER.warn("No data for position: {}", SectionPos.of(p_63788_));
++    protected void setDirty(long p_63788_) { // MCMT: write lock
++        this.mcmtLock.writeLock().lock();
++        try {
++            Optional<R> optional = this.storage.get(p_63788_);
++            if (optional != null && !optional.isEmpty()) {
++                this.dirty.add(p_63788_);
++            } else {
++                LOGGER.warn("No data for position: {}", SectionPos.of(p_63788_));
++            }
++        } finally {
++            this.mcmtLock.writeLock().unlock();
+         }
+     }
+ 
+@@ -222,20 +_,38 @@
          return p_63806_.get("DataVersion").asInt(1945);
      }
  
 -    public void flush(ChunkPos p_63797_) {
-+    public synchronized void flush(ChunkPos p_63797_) { // MCMT: synchronized
-         if (this.hasWork()) {
-             for (int i = this.levelHeightAccessor.getMinSection(); i < this.levelHeightAccessor.getMaxSection(); i++) {
-                 long j = getKey(p_63797_, i);
-@@ -237,5 +_,13 @@
+-        if (this.hasWork()) {
+-            for (int i = this.levelHeightAccessor.getMinSection(); i < this.levelHeightAccessor.getMaxSection(); i++) {
+-                long j = getKey(p_63797_, i);
+-                if (this.dirty.contains(j)) {
+-                    this.writeColumn(p_63797_);
+-                    return;
++    public void flush(ChunkPos p_63797_) { // MCMT: write lock
++        this.mcmtLock.writeLock().lock();
++        try {
++            if (!this.dirty.isEmpty()) {
++                for (int i = this.levelHeightAccessor.getMinSection(); i < this.levelHeightAccessor.getMaxSection(); i++) {
++                    long j = getKey(p_63797_, i);
++                    if (this.dirty.contains(j)) {
++                        this.writeColumn(p_63797_);
++                        return;
++                    }
+                 }
+             }
++        } finally {
++            this.mcmtLock.writeLock().unlock();
+         }
+     }
+ 
      @Override
      public void close() throws IOException {
          this.simpleRegionStorage.close();
@@ -101,7 +281,12 @@
 +     * Neo: Removes the data for the given chunk position.
 +     * See PR #937
 +     */
-+    public synchronized void remove(long sectionPosAsLong) { // MCMT: synchronized
-+        this.storage.remove(sectionPosAsLong);
++    public void remove(long sectionPosAsLong) { // MCMT: write lock
++        this.mcmtLock.writeLock().lock();
++        try {
++            this.storage.remove(sectionPosAsLong);
++        } finally {
++            this.mcmtLock.writeLock().unlock();
++        }
      }
  }
