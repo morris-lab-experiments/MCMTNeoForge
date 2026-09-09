@@ -1,6 +1,6 @@
 --- a/net/minecraft/world/level/entity/PersistentEntitySectionManager.java
 +++ b/net/minecraft/world/level/entity/PersistentEntitySectionManager.java
-@@ -32,6 +_,18 @@
+@@ -32,13 +_,43 @@
  public class PersistentEntitySectionManager<T extends EntityAccess> implements AutoCloseable {
      static final Logger LOGGER = LogUtils.getLogger();
      final Set<UUID> knownUuids = Sets.newHashSet();
@@ -19,6 +19,33 @@
      final LevelCallback<T> callbacks;
      private final EntityPersistentStorage<T> permanentStorage;
      private final EntityLookup<T> visibleEntityStorage;
+     final EntitySectionStorage<T> sectionStorage;
+     private final LevelEntityGetter<T> entityGetter;
+-    private final Long2ObjectMap<Visibility> chunkVisibility = new Long2ObjectOpenHashMap<>();
+-    private final Long2ObjectMap<PersistentEntitySectionManager.ChunkLoadStatus> chunkLoadStatuses = new Long2ObjectOpenHashMap<>();
++    // MCMT hook H2: chunkVisibility and chunkLoadStatuses are plain open-addressed fastutil maps that vanilla
++    // only ever touched on the server thread. Under MCMT updateChunkStatus runs on whichever thread drains this
++    // chunk source's main-thread queue, and mcmtPumpUntil lets a pool worker drain that queue while it resolves a
++    // chunk load (MCMT-PLAN 4c/4i). A full-chunk-status promotion runnable queued there calls
++    // ChunkMap.onChunkStatusChange -> updateChunkStatus, so a worker can write both maps mid-tick. Other workers
++    // read them at the same time: every block-entity tick reaches chunkLoadStatuses.get through
++    // LevelChunk.isTicking -> ServerLevel.areEntitiesLoaded, and the natural-spawn pass reaches
++    // chunkVisibility.get through canPositionTick. A get that races a put's resize on an open-addressed map can
++    // return a wrong value or spin, and "never seen to crash" does not rule that out -- a wrong Visibility just
++    // makes an entity skip a tick.
++    //
++    // Wrap both maps in fastutil's synchronized view. Every get, put and remove becomes atomic under the view's
++    // own mutex, which is a leaf: the only code that runs while you hold it is the map's O(1) work, so it adds no
++    // ordering constraint against mcmtStructuralLock or the chunk-load lock and cannot deadlock. The check-then-act
++    // in ensureChunkQueuedForLoad stays non-atomic, but only the single holder of the chunk-load pump lock and the
++    // main-thread-only tick() and save phases ever run it, so no duplicate chunk-load request appears.
++    private final Long2ObjectMap<Visibility> chunkVisibility = Long2ObjectMaps.synchronize(new Long2ObjectOpenHashMap<>());
++    private final Long2ObjectMap<PersistentEntitySectionManager.ChunkLoadStatus> chunkLoadStatuses = Long2ObjectMaps.synchronize(
++        new Long2ObjectOpenHashMap<>()
++    );
+     private final LongSet chunksToUnload = new LongOpenHashSet();
+     private final Queue<ChunkEntities<T>> loadingInbox = Queues.newConcurrentLinkedQueue();
+ 
 @@ -71,7 +_,22 @@
          return this.addEntity(p_157534_, false);
      }
@@ -74,6 +101,24 @@
              this.chunkLoadStatuses.put(chunkentities.getPos().toLong(), PersistentEntitySectionManager.ChunkLoadStatus.LOADED);
          }
      }
+@@ -241,9 +_,14 @@
+     private LongSet getAllChunksToSave() {
+         LongSet longset = this.sectionStorage.getAllChunksWithExistingSections();
+ 
+-        for (Entry<PersistentEntitySectionManager.ChunkLoadStatus> entry : Long2ObjectMaps.fastIterable(this.chunkLoadStatuses)) {
+-            if (entry.getValue() == PersistentEntitySectionManager.ChunkLoadStatus.LOADED) {
+-                longset.add(entry.getLongKey());
++        // MCMT hook H2: iterating the synchronized view is not atomic on its own, so hold the view's mutex for
++        // the whole walk. This runs only on the save and shutdown paths, when no worker writes the map, but the
++        // guard keeps the iteration correct if that ever changes.
++        synchronized (this.chunkLoadStatuses) {
++            for (Entry<PersistentEntitySectionManager.ChunkLoadStatus> entry : Long2ObjectMaps.fastIterable(this.chunkLoadStatuses)) {
++                if (entry.getValue() == PersistentEntitySectionManager.ChunkLoadStatus.LOADED) {
++                    longset.add(entry.getLongKey());
++                }
+             }
+         }
+ 
 @@ -367,11 +_,13 @@
  
      class Callback implements EntityInLevelCallback {
