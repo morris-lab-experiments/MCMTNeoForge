@@ -1,0 +1,30 @@
+--- a/net/minecraft/world/entity/ai/behavior/AcquirePoi.java
++++ b/net/minecraft/world/entity/ai/behavior/AcquirePoi.java
+@@ -82,7 +_,26 @@
+                                     if (path != null && path.canReach()) {
+                                         BlockPos blockpos = path.getTarget();
+                                         poimanager.getType(blockpos).ifPresent(p_340720_ -> {
+-                                            poimanager.take(p_260007_, (p_217108_, p_217109_) -> p_217109_.equals(blockpos), blockpos, 1);
++                                            // MCMT: honour take()'s result rather than assuming it succeeded.
++                                            //
++                                            // The POI above was chosen by findAllClosestFirstWithType with Occupancy.HAS_SPACE, and
++                                            // findPathToPois then runs a pathfind before this take. That is a wide window. Two workers
++                                            // ticking two villagers can both see the last free ticket, both pathfind, and both arrive
++                                            // here; take is write-locked so only one actually acquires, but vanilla discards the result
++                                            // and writes the memory regardless, so both villagers end up believing they own the POI.
++                                            //
++                                            // Nothing crashes. Two villagers share one bed, and the POI's claimed count no longer matches
++                                            // the number of villagers naming it -- the silent-divergence shape that gametests, soaks and
++                                            // benchmarks all miss. Vanilla is safe only because nothing else runs between the query and
++                                            // the take.
++                                            //
++                                            // take already returns the position it acquired, so the fix is to use it: a villager that lost
++                                            // the race records no memory and retries next tick, exactly as if the POI had been full when
++                                            // it looked.
++                                            if (poimanager.take(p_260007_, (p_217108_, p_217109_) -> p_217109_.equals(blockpos), blockpos, 1).isEmpty()) {
++                                                return;
++                                            }
++
+                                             p_258300_.set(GlobalPos.of(p_258292_.dimension(), blockpos));
+                                             p_260129_.ifPresent(p_147369_ -> p_258292_.broadcastEntityEvent(p_258293_, p_147369_));
+                                             long2objectmap.clear();
