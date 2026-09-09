@@ -444,6 +444,40 @@
          return this.fluidHeight.getDouble(p_204037_);
      }
  
+@@ -3228,11 +_,30 @@
+     }
+ 
+     public BlockState getInBlockState() {
+-        if (this.inBlockState == null) {
+-            this.inBlockState = this.level().getBlockState(this.blockPosition());
++        // MCMT: read the cached state once into a local, and never re-read the field to return it.
++        //
++        // inBlockState is a plain lazily-filled cache that this entity's own tick invalidates -- baseTick
++        // clears it every tick, and setPosRaw clears it whenever the entity crosses a block boundary. Vanilla
++        // only ever reached it from the owning entity's thread, so a null between the check and the return was
++        // impossible.
++        //
++        // It is reachable across entities: LivingEntity.pushEntities streams the nearby entities and tests
++        // EntitySelector.pushableBy, which calls isPushable and so onClimbable and getInBlockState on the
++        // OTHER entity. Under parallel entity ticks that other entity is ticking on another worker and can
++        // null the field between this method's null check and its return, so the caller received null.
++        // Vanilla treats a block state as never null, so it crashed in CommonHooks.isLivingOnLadder and
++        // AutoFilter chunk-locked the entity class for the rest of the run.
++        //
++        // Reading once into a local cannot return null. A concurrent invalidation is then benign: you get the
++        // state from a moment earlier, which is what a cache of the entity's own position means anyway, and
++        // what parallel ticking already permits everywhere else.
++        BlockState blockstate = this.inBlockState;
++        if (blockstate == null) {
++            blockstate = this.level().getBlockState(this.blockPosition());
++            this.inBlockState = blockstate;
+         }
+ 
+-        return this.inBlockState;
++        return blockstate;
+     }
+ 
+     public ChunkPos chunkPosition() {
 @@ -3323,6 +_,7 @@
  
              this.levelCallback.onMove();
