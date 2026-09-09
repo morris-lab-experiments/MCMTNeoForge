@@ -1,0 +1,59 @@
+--- a/net/minecraft/world/level/pathfinder/PathTypeCache.java
++++ b/net/minecraft/world/level/pathfinder/PathTypeCache.java
+@@ -8,8 +_,18 @@
+ public class PathTypeCache {
+     private static final int SIZE = 4096;
+     private static final int MASK = 4095;
+-    private final long[] positions = new long[4096];
+-    private final PathType[] pathTypes = new PathType[4096];
++    // MCMT: one PathTypeCache lives per ServerLevel (ServerLevel.pathTypesByPosCache) and every mob reads it
++    // through PathfindingContext during pathfinding. Under parallel entity ticks many workers pathfind at once,
++    // so a plain long[]/PathType[] pair is a data race: compute() writes the slot key before the slot value with
++    // no ordering, so a concurrent get() that sees the fresh key can still read the previous occupant's value --
++    // a stale PathType for a colliding block position, or null for a never-filled slot. AtomicLongArray and
++    // AtomicReferenceArray give each element volatile publication. compute() now writes the value before the key,
++    // and get() re-reads the key after the value, so a key that matches on both sides guarantees the value
++    // belongs to this position; anything else falls through to a recompute, which is pure and idempotent. This
++    // costs a few volatile loads on the hot path and no lock -- there is no shared contended word here, unlike
++    // the PoiManager lock in MCMT-PLAN.md section 4n -- and single-threaded results are unchanged.
++    private final java.util.concurrent.atomic.AtomicLongArray positions = new java.util.concurrent.atomic.AtomicLongArray(4096);
++    private final java.util.concurrent.atomic.AtomicReferenceArray<PathType> pathTypes = new java.util.concurrent.atomic.AtomicReferenceArray<>(4096);
+ 
+     public PathType getOrCompute(BlockGetter p_330930_, BlockPos p_331162_) {
+         long i = p_331162_.asLong();
+@@ -20,21 +_,30 @@
+ 
+     @Nullable
+     private PathType get(int p_330588_, long p_331771_) {
+-        return this.positions[p_330588_] == p_331771_ ? this.pathTypes[p_330588_] : null;
++        // MCMT: read the key, then the value, then the key again. compute() publishes the value before the key,
++        // so a key seen on both sides of the value read means the value is the one for this position; a mismatch
++        // (a concurrent writer took the slot) reports a miss and getOrCompute() recomputes.
++        if (this.positions.get(p_330588_) != p_331771_) {
++            return null;
++        }
++        PathType pathtype = this.pathTypes.get(p_330588_);
++        return this.positions.get(p_330588_) == p_331771_ ? pathtype : null;
+     }
+ 
+     private PathType compute(BlockGetter p_330773_, BlockPos p_330311_, int p_330671_, long p_332065_) {
+         PathType pathtype = WalkNodeEvaluator.getPathTypeFromState(p_330773_, p_330311_);
+-        this.positions[p_330671_] = p_332065_;
+-        this.pathTypes[p_330671_] = pathtype;
++        // MCMT: publish the value before the key so a concurrent get() that observes the key also observes this
++        // value.
++        this.pathTypes.set(p_330671_, pathtype);
++        this.positions.set(p_330671_, p_332065_);
+         return pathtype;
+     }
+ 
+     public void invalidate(BlockPos p_331507_) {
+         long i = p_331507_.asLong();
+         int j = index(i);
+-        if (this.positions[j] == i) {
+-            this.pathTypes[j] = null;
++        if (this.positions.get(j) == i) {
++            this.pathTypes.set(j, null);
+         }
+     }
+ 
