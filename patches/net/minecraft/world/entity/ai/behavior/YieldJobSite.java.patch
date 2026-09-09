@@ -1,0 +1,30 @@
+--- a/net/minecraft/world/entity/ai/behavior/YieldJobSite.java
++++ b/net/minecraft/world/entity/ai/behavior/YieldJobSite.java
+@@ -82,6 +_,27 @@
+     }
+ 
+     private static boolean canReachPos(PathfinderMob p_260080_, BlockPos p_259875_, PoiType p_259606_) {
++        // MCMT: this probe pathfinds on ANOTHER mob's navigation. YieldJobSite's trigger streams the nearby
++        // villagers and asks each one whether it wants this job site, so villager A's tick reaches villager B's
++        // PathNavigation here -- and PathFinder, NodeEvaluator and BinaryHeap are per-mob and single-threaded.
++        // While A runs this, B ticks its own navigation on another worker. Whichever finishes first calls
++        // NodeEvaluator.done(), which nulls `mob` and `currentContext` under the other, and the loser throws
++        // NullPointerException inside this stream. That is the villager-only, spawn-time crash of MCMT-PLAN 4m,
++        // and it also corrupts the per-mob path-type cache and the open set.
++        //
++        // 4j fixed the one cross-mob route it knew about -- ServerLevel.sendBlockUpdated's navigatingMobs loop --
++        // but that guards recomputePath, not createPath, so this route was never covered.
++        //
++        // A lock on B's navigation is not the answer: A can probe B while B probes A, which is a deadlock. Off
++        // the server thread, skip the probe and answer optimistically instead. Being wrong costs one yielded job
++        // site to a villager who cannot reach it, which B's own AcquirePoi and ValidateNearbyPoi undo on a later
++        // tick; villagers penned in one base are almost always mutually reachable, so it is rarely wrong at all.
++        // Answering "not reachable" instead would be worse: entity ticks never run on the server thread under
++        // MCMT, so it would turn YieldJobSite into a permanent no-op.
++        if (net.neoforged.neoforge.mcmt.MCMT.isPoolThread()) {
++            return true;
++        }
++
+         Path path = p_260080_.getNavigation().createPath(p_259875_, p_259606_.validRange());
+         return path != null && path.canReach();
+     }
