@@ -35,3 +35,59 @@
      }
  
      public static <T> Codec<PalettedContainer<T>> codecRW(IdMap<T> p_238372_, Codec<T> p_238373_, PalettedContainer.Strategy p_238374_, T p_238375_) {
+@@ -153,8 +_,54 @@
+     }
+ 
+     protected T get(int p_63086_) {
++        // MCMT: lock-free read, with a locked retry on the rare palette-publication race.
++        //
++        // The write path (set / getAndSet / onResize) runs under `lock`; this read does not, so it
++        // has no happens-before edge with a concurrent writer. A writer that grows the palette does
++        // it in plain, unsynchronised steps: LinearPalette.idFor stores the value into `values[id]`
++        // and then bumps `size`, and CrudeIncrementalIntIdentityHashBiMap.addMapping stores into
++        // `byId[id]`; the caller then writes `id` into the backing long array. A reader can observe
++        // the storage write and the bumped `size` without yet observing the `values[id]` /
++        // `byId[id]` write, so LinearPalette.valueFor returns a null slot and HashMapPalette.valueFor
++        // throws MissingPaletteEntryException. Vanilla treats both as impossible: getBlockState then
++        // returns a null state, the worker tick crashes on it, and AutoFilter chunk-locks the entity
++        // class for the rest of the run.
++        //
++        // The success path stays byte-for-byte vanilla: one volatile read of `data`, one storage
++        // read, one palette lookup. valueFor never returns null on a single thread, so the null check
++        // is always false and the retry is dead code. On a miss, take the write lock once and
++        // re-read: the racing writer's release() happens-before this acquire(), so the palette and
++        // storage are fully published and mutually consistent. A stale-but-non-null fast-path result
++        // is returned as is; it is a value that was correct a moment earlier, which parallel ticking
++        // already permits.
+         PalettedContainer.Data<T> data = this.data;
+-        return data.palette.valueFor(data.storage.get(p_63086_));
++
++        try {
++            T t = data.palette.valueFor(data.storage.get(p_63086_));
++            if (t != null) {
++                return t;
++            }
++        } catch (MissingPaletteEntryException missing) {
++            // A phantom miss from the race. Fall through to the locked retry. Nothing else on this path
++            // throws: the BitStorage bounds check raises IllegalArgumentException, which is a genuine
++            // fault and must propagate.
++        }
++
++        return this.getUnderLock(p_63086_);
++    }
++
++    // MCMT: the locked slow path for get(int). You reach this only when the lock-free read raced a
++    // concurrent palette growth. Under the lock every writer's publication is complete, so this
++    // re-read returns the true value; an exception thrown here is a genuine fault and propagates.
++    private T getUnderLock(int index) {
++        this.acquire();
++
++        try {
++            PalettedContainer.Data<T> data = this.data;
++            return data.palette.valueFor(data.storage.get(index));
++        } finally {
++            this.release();
++        }
+     }
+ 
+     @Override
