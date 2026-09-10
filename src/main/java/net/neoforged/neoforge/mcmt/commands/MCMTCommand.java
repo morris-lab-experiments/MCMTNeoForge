@@ -5,16 +5,27 @@
 
 package net.neoforged.neoforge.mcmt.commands;
 
+import com.mojang.authlib.GameProfile;
 import com.mojang.brigadier.CommandDispatcher;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.context.CommandContext;
+import com.mojang.brigadier.exceptions.CommandSyntaxException;
 import com.mojang.brigadier.suggestion.SuggestionProvider;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelOutboundHandlerAdapter;
+import io.netty.channel.ChannelPromise;
+import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.util.ReferenceCountUtil;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
@@ -22,7 +33,17 @@ import net.minecraft.ChatFormatting;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.SharedSuggestionProvider;
+import net.minecraft.commands.arguments.coordinates.BlockPosArgument;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.network.Connection;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.protocol.PacketFlow;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.network.CommonListenerCookie;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.inventory.ClickType;
+import net.minecraft.world.phys.Vec3;
 import net.neoforged.neoforge.mcmt.MCMT;
 import net.neoforged.neoforge.mcmt.config.MCMTConfig;
 import net.neoforged.neoforge.mcmt.parallel.MCMTThreadPool;
@@ -144,6 +165,40 @@ public final class MCMTCommand {
                 .then(Commands.literal("save").executes(MCMTCommand::save))
                 .then(Commands.literal("reload").executes(MCMTCommand::reload))
                 .then(Commands.literal("restart").executes(MCMTCommand::restart))
+                .then(Commands.literal("testplayer")
+                        .then(Commands.literal("spawn")
+                                .executes(ctx -> spawnTestPlayers(ctx, 1))
+                                .then(Commands.argument("count", IntegerArgumentType.integer(1, 64))
+                                        .executes(ctx -> spawnTestPlayers(ctx, IntegerArgumentType.getInteger(ctx, "count")))))
+                        .then(Commands.literal("remove").executes(MCMTCommand::removeTestPlayers))
+                        .then(Commands.literal("open")
+                                .then(Commands.argument("index", IntegerArgumentType.integer(0))
+                                        .then(Commands.argument("pos", BlockPosArgument.blockPos())
+                                                .executes(MCMTCommand::testPlayerOpen))))
+                        .then(Commands.literal("click")
+                                .then(Commands.argument("index", IntegerArgumentType.integer(0))
+                                        .then(Commands.argument("slot", IntegerArgumentType.integer(-999))
+                                                .then(Commands.argument("button", IntegerArgumentType.integer(0, 8))
+                                                        .then(Commands.argument("type", StringArgumentType.word())
+                                                                .executes(MCMTCommand::testPlayerClick))))))
+                        .then(Commands.literal("close")
+                                .then(Commands.argument("index", IntegerArgumentType.integer(0))
+                                        .executes(MCMTCommand::testPlayerClose)))
+                        .then(Commands.literal("use")
+                                .then(Commands.argument("index", IntegerArgumentType.integer(0))
+                                        .then(Commands.argument("pos", BlockPosArgument.blockPos())
+                                                .executes(ctx -> testPlayerUse(ctx, Direction.UP)))))
+                        .then(Commands.literal("drop")
+                                .then(Commands.argument("index", IntegerArgumentType.integer(0))
+                                        .executes(ctx -> testPlayerDrop(ctx, false))
+                                        .then(Commands.literal("all").executes(ctx -> testPlayerDrop(ctx, true)))))
+                        .then(Commands.literal("moveto")
+                                .then(Commands.argument("index", IntegerArgumentType.integer(0))
+                                        .then(Commands.argument("pos", BlockPosArgument.blockPos())
+                                                .executes(MCMTCommand::testPlayerMoveTo))))
+                        .then(Commands.literal("reset")
+                                .then(Commands.argument("index", IntegerArgumentType.integer(0))
+                                        .executes(MCMTCommand::testPlayerReset))))
                 .then(Commands.literal("config")
                         .executes(MCMTCommand::listConfig)
                         .then(Commands.argument("key", StringArgumentType.word())
@@ -272,6 +327,207 @@ public final class MCMTCommand {
         MCMTConfig.bake();
         ctx.getSource().sendSuccess(() -> Component.literal("MCMT configuration re-read from disk."), true);
         return 1;
+    }
+
+    /**
+     * Test players spawned by {@code /mcmt testplayer spawn}, so {@code remove} can take them away again.
+     * Only ever touched from the command thread, which is the server thread.
+     */
+    private static final List<ServerPlayer> TEST_PLAYERS = new ArrayList<>();
+
+    /**
+     * Puts one or more headless players into the world, so player-gated vanilla code actually runs.
+     *
+     * <p>A surprising amount of Minecraft does nothing at all when nobody is connected, and the divergence
+     * harnesses connect nobody. {@code BaseSpawner.serverTick} returns immediately unless
+     * {@code Level.hasNearbyAlivePlayer} finds someone inside {@code RequiredPlayerRange}; natural mob
+     * spawning is driven off player positions; a villager only becomes willing to trade when a player opens
+     * the menu. Every one of those is a tick path MCMT parallelises and no scenario has ever exercised.
+     *
+     * <p>The player is real — a {@link ServerPlayer} placed through {@code PlayerList.placeNewPlayer}, so it
+     * lands in {@code level.players()} where {@code hasNearbyAlivePlayer} looks. What is fake is the socket:
+     * the connection sits on an in-memory Netty {@link EmbeddedChannel}, the same arrangement
+     * {@code GameTestHelper.makeMockServerPlayerInLevel} uses, so no network stack is involved.
+     *
+     * <p>An {@code EmbeddedChannel} keeps everything written to it in an outbound buffer forever, and the
+     * server writes chunk and entity-tracking packets to this player every tick. Over a sprint of tens of
+     * thousands of ticks that is an unbounded leak that would look like a scenario fault rather than a
+     * harness one, so a discarding handler is installed at the head of the pipeline: outbound messages are
+     * released and their promises completed, and nothing accumulates.
+     *
+     * <p>This is a diagnostic for the test harnesses, not a gameplay feature. It requires the same admin
+     * permission as the rest of {@code /mcmt}.
+     */
+    private static int spawnTestPlayers(CommandContext<CommandSourceStack> ctx, int count) {
+        CommandSourceStack source = ctx.getSource();
+        net.minecraft.server.level.ServerLevel level = source.getLevel();
+        net.minecraft.world.phys.Vec3 at = source.getPosition();
+
+        int spawned = 0;
+
+        for (int i = 0; i < count; i++) {
+            GameProfile profile = new GameProfile(UUID.randomUUID(), "mcmt-test-" + TEST_PLAYERS.size());
+            CommonListenerCookie cookie = CommonListenerCookie.createInitial(profile, false);
+            ServerPlayer player = new ServerPlayer(level.getServer(), level, profile, cookie.clientInformation()) {
+                @Override
+                public boolean isSpectator() {
+                    // hasNearbyAlivePlayer filters spectators out, so a spectating test player would be
+                    // invisible to exactly the code this exists to reach.
+                    return false;
+                }
+
+                @Override
+                public boolean isCreative() {
+                    return true;
+                }
+            };
+
+            Connection connection = new Connection(PacketFlow.SERVERBOUND);
+            EmbeddedChannel channel = new EmbeddedChannel(connection);
+            channel.pipeline().addFirst("mcmt-discard-outbound", new ChannelOutboundHandlerAdapter() {
+                @Override
+                public void write(ChannelHandlerContext handlerCtx, Object msg, ChannelPromise promise) {
+                    // Outbound handlers run tail to head, so sitting at the head means every packet is
+                    // dropped here rather than piling up in the channel's outbound queue.
+                    ReferenceCountUtil.release(msg);
+                    promise.setSuccess();
+                }
+            });
+
+            level.getServer().getPlayerList().placeNewPlayer(connection, player, cookie);
+            player.teleportTo(level, at.x, at.y, at.z, player.getYRot(), player.getXRot());
+            TEST_PLAYERS.add(player);
+            spawned++;
+        }
+
+        int total = spawned;
+        source.sendSuccess(
+                () -> Component.literal(
+                        "Spawned " + total + " headless test player(s); " + TEST_PLAYERS.size() + " now present. "
+                                + "Spawners, natural spawning and trading are live in their vicinity."),
+                true);
+        return total;
+    }
+
+    /**
+     * Resolves a test player by its index in {@link #TEST_PLAYERS}, or reports why it could not.
+     *
+     * <p>Returns {@code null} rather than throwing, so every caller reports a failure the harness can see. A
+     * scripted scenario that silently interacted with nobody would pass while proving nothing, which is the
+     * failure mode this whole command set exists to avoid.
+     */
+    private static ServerPlayer testPlayer(CommandContext<CommandSourceStack> ctx) {
+        int index = IntegerArgumentType.getInteger(ctx, "index");
+
+        if (index >= TEST_PLAYERS.size()) {
+            ctx.getSource()
+                    .sendFailure(Component.literal("No test player at index " + index + " (" + TEST_PLAYERS.size()
+                            + " present). Use /mcmt testplayer spawn first."));
+            return null;
+        }
+
+        return TEST_PLAYERS.get(index);
+    }
+
+    /**
+     * Reports an interaction's outcome, loudly when it failed.
+     *
+     * <p>A rejected interaction returns 0, so a driving script sees a non-successful command result instead of
+     * carrying on as though the click had landed. An interaction the server quietly ignored leaves every total
+     * unchanged, and a conservation check would then read green.
+     */
+    private static int report(CommandSourceStack source, TestPlayerActions.Outcome outcome) {
+        if (outcome.ok()) {
+            source.sendSuccess(() -> Component.literal(outcome.detail()), true);
+            return 1;
+        }
+
+        source.sendFailure(Component.literal("interaction rejected: " + outcome.detail()));
+        return 0;
+    }
+
+    private static int testPlayerOpen(CommandContext<CommandSourceStack> ctx) throws CommandSyntaxException {
+        ServerPlayer player = testPlayer(ctx);
+
+        if (player == null) {
+            return 0;
+        }
+
+        BlockPos pos = BlockPosArgument.getLoadedBlockPos(ctx, "pos");
+        return report(ctx.getSource(), TestPlayerActions.openContainer(player, pos));
+    }
+
+    private static int testPlayerClick(CommandContext<CommandSourceStack> ctx) {
+        ServerPlayer player = testPlayer(ctx);
+
+        if (player == null) {
+            return 0;
+        }
+
+        int slot = IntegerArgumentType.getInteger(ctx, "slot");
+        int button = IntegerArgumentType.getInteger(ctx, "button");
+        ClickType type;
+
+        try {
+            type = ClickType.valueOf(StringArgumentType.getString(ctx, "type").toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException unknown) {
+            ctx.getSource()
+                    .sendFailure(Component.literal(
+                            "unknown click type; expected one of PICKUP, QUICK_MOVE, SWAP, CLONE, THROW, QUICK_CRAFT, PICKUP_ALL"));
+            return 0;
+        }
+
+        return report(ctx.getSource(), TestPlayerActions.containerClick(player, slot, button, type));
+    }
+
+    private static int testPlayerClose(CommandContext<CommandSourceStack> ctx) {
+        ServerPlayer player = testPlayer(ctx);
+        return player == null ? 0 : report(ctx.getSource(), TestPlayerActions.closeContainer(player));
+    }
+
+    private static int testPlayerUse(CommandContext<CommandSourceStack> ctx, Direction face) throws CommandSyntaxException {
+        ServerPlayer player = testPlayer(ctx);
+
+        if (player == null) {
+            return 0;
+        }
+
+        BlockPos pos = BlockPosArgument.getLoadedBlockPos(ctx, "pos");
+        return report(ctx.getSource(), TestPlayerActions.useBlock(player, pos, face, InteractionHand.MAIN_HAND));
+    }
+
+    private static int testPlayerDrop(CommandContext<CommandSourceStack> ctx, boolean wholeStack) {
+        ServerPlayer player = testPlayer(ctx);
+        return player == null ? 0 : report(ctx.getSource(), TestPlayerActions.dropSelected(player, wholeStack));
+    }
+
+    private static int testPlayerMoveTo(CommandContext<CommandSourceStack> ctx) throws CommandSyntaxException {
+        ServerPlayer player = testPlayer(ctx);
+
+        if (player == null) {
+            return 0;
+        }
+
+        BlockPos pos = BlockPosArgument.getLoadedBlockPos(ctx, "pos");
+        return report(ctx.getSource(), TestPlayerActions.placeAt(player, Vec3.atCenterOf(pos)));
+    }
+
+    private static int testPlayerReset(CommandContext<CommandSourceStack> ctx) {
+        ServerPlayer player = testPlayer(ctx);
+        return player == null ? 0 : report(ctx.getSource(), TestPlayerActions.reset(player));
+    }
+
+    /** Disconnects every player {@code /mcmt testplayer spawn} created. */
+    private static int removeTestPlayers(CommandContext<CommandSourceStack> ctx) {
+        int removed = TEST_PLAYERS.size();
+
+        for (ServerPlayer player : TEST_PLAYERS) {
+            player.connection.disconnect(Component.literal("MCMT test player removed"));
+        }
+
+        TEST_PLAYERS.clear();
+        ctx.getSource().sendSuccess(() -> Component.literal("Removed " + removed + " test player(s)."), true);
+        return removed;
     }
 
     private static int restart(CommandContext<CommandSourceStack> ctx) {
