@@ -1,5 +1,22 @@
 --- a/net/minecraft/world/level/material/FlowingFluid.java
 +++ b/net/minecraft/world/level/material/FlowingFluid.java
+@@ -43,7 +_,15 @@
+         object2bytelinkedopenhashmap.defaultReturnValue((byte)127);
+         return object2bytelinkedopenhashmap;
+     });
+-    private final Map<FluidState, VoxelShape> shapes = Maps.newIdentityHashMap();
++    // MCMT: this cache used to be a plain IdentityHashMap, populated via computeIfAbsent in getShape
++    // below. FlowingFluid is a singleton shared by every level (one instance per fluid, e.g. WATER), and
++    // H1 ticks levels in parallel, so two levels computing a fluid's collision shape at once called
++    // computeIfAbsent on the same non-concurrent map from different threads. FluidState does not override
++    // equals/hashCode (checked up through its only ancestor, StateHolder), so its keys already compare by
++    // reference identity; a ConcurrentHashMap keyed on FluidState therefore behaves exactly like the
++    // IdentityHashMap it replaces, with no semantic change, and additionally guarantees computeIfAbsent is
++    // atomic per key, so no two threads build the same shape entry at once.
++    private final Map<FluidState, VoxelShape> shapes = new java.util.concurrent.ConcurrentHashMap<>();
+ 
+     @Override
+     protected void createFluidStateDefinition(StateDefinition.Builder<Fluid, FluidState> p_76046_) {
 @@ -164,7 +_,7 @@
              BlockState blockstate = p_256464_.getBlockState(blockpos);
              FluidState fluidstate = blockstate.getFluidState();
