@@ -1,0 +1,55 @@
+--- a/net/minecraft/world/level/block/RedstoneTorchBlock.java
++++ b/net/minecraft/world/level/block/RedstoneTorchBlock.java
+@@ -21,7 +_,23 @@
+ public class RedstoneTorchBlock extends BaseTorchBlock {
+     public static final MapCodec<RedstoneTorchBlock> CODEC = simpleCodec(RedstoneTorchBlock::new);
+     public static final BooleanProperty LIT = BlockStateProperties.LIT;
+-    private static final Map<BlockGetter, List<RedstoneTorchBlock.Toggle>> RECENT_TOGGLES = new WeakHashMap<>();
++    // MCMT: this cache used to be a plain WeakHashMap, read at tick() below and written via
++    // computeIfAbsent in isToggledTooFrequently. RedstoneTorchBlock is a singleton shared by every level,
++    // and H1 ticks levels in parallel, so two levels toggling torches at the same instant called
++    // computeIfAbsent on the same non-concurrent map from different threads -- not just a lost update on
++    // one entry, but WeakHashMap internal-structure corruption (lost entries, or a resize that loops
++    // forever). Guava's MapMaker with weakKeys() gives a thread-safe map and keeps the original
++    // WeakHashMap's point -- an unloaded level's List<Toggle> can still be collected instead of pinned in
++    // this static map for the life of the JVM -- but it does NOT make computeIfAbsent atomic: the
++    // MapMakerInternalMap family implements ConcurrentMap without overriding computeIfAbsent, so the call
++    // falls back to java.util.Map's default get-then-put, which is not a single atomic step. Two threads
++    // racing computeIfAbsent for the same still-absent key can each build their own list and each put it;
++    // the losing thread then keeps mutating an orphaned local list that the map no longer holds, silently
++    // dropping that level's toggle history. isToggledTooFrequently below guards its computeIfAbsent call
++    // with a lock on this map instead of trusting the map's own atomicity.
++    private static final Map<BlockGetter, List<RedstoneTorchBlock.Toggle>> RECENT_TOGGLES = new com.google.common.collect.MapMaker()
++        .weakKeys()
++        .makeMap();
+     public static final int RECENT_TOGGLE_TIMER = 60;
+     public static final int MAX_RECENT_TOGGLES = 8;
+     public static final int RESTART_DELAY = 160;
+@@ -65,6 +_,12 @@
+     @Override
+     protected void tick(BlockState p_221949_, ServerLevel p_221950_, BlockPos p_221951_, RandomSource p_221952_) {
+         boolean flag = this.hasNeighborSignal(p_221950_, p_221951_, p_221949_);
++        // MCMT: deliberately left unlocked, unlike the computeIfAbsent call below. A single get() is one
++        // atomic operation on this map's own get/put implementation regardless of what else is
++        // concurrently happening to other keys or even this key: it observes either "not published yet"
++        // (null, handled by the null check right below) or a fully-published list, never a torn read. The
++        // hazard the lock below fixes is specifically a get-then-put COMPOUND op racing itself across two
++        // threads for the same absent key, which this bare get() is not.
+         List<RedstoneTorchBlock.Toggle> list = RECENT_TOGGLES.get(p_221950_);
+ 
+         while (list != null && !list.isEmpty() && p_221950_.getGameTime() - list.get(0).when > 60L) {
+@@ -117,7 +_,13 @@
+     }
+ 
+     private static boolean isToggledTooFrequently(Level p_55685_, BlockPos p_55686_, boolean p_55687_) {
+-        List<RedstoneTorchBlock.Toggle> list = RECENT_TOGGLES.computeIfAbsent(p_55685_, p_55680_ -> Lists.newArrayList());
++        // MCMT: computeIfAbsent is not atomic on this map (see the field comment above), so make the
++        // whole read-or-create atomic by locking the map itself instead. This runs once per torch toggle,
++        // not in a tight loop, so a shared lock here costs nothing worth avoiding.
++        List<RedstoneTorchBlock.Toggle> list;
++        synchronized (RECENT_TOGGLES) {
++            list = RECENT_TOGGLES.computeIfAbsent(p_55685_, p_55680_ -> Lists.newArrayList());
++        }
+         if (p_55687_) {
+             list.add(new RedstoneTorchBlock.Toggle(p_55686_.immutable(), p_55685_.getGameTime()));
+         }
