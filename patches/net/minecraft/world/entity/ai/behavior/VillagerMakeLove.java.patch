@@ -1,6 +1,58 @@
 --- a/net/minecraft/world/entity/ai/behavior/VillagerMakeLove.java
 +++ b/net/minecraft/world/entity/ai/behavior/VillagerMakeLove.java
-@@ -112,6 +_,8 @@
+@@ -19,6 +_,14 @@
+ 
+ public class VillagerMakeLove extends Behavior<Villager> {
+     private long birthTimestamp;
++    // MCMT: see breed() and checkExtraStartConditions(). A partner cooldown queued on another worker's tick
++    // lands here instead of being written cross-thread, and gets applied on the partner's own tick. Weakly
++    // keyed: an entry is only drained by that villager's own checkExtraStartConditions, which requires it to
++    // become a BREED_TARGET candidate again, and a villager that dies (or simply never breeds again) before
++    // that happens would otherwise pin its full Villager object -- brain, inventory, level backreference --
++    // for the JVM's lifetime. A weak-keyed map lets the entry drop once nothing else holds the Villager
++    // strongly, with no removal hook needed.
++    private static final java.util.Map<Villager, Boolean> MCMT_PENDING_COOLDOWN = new com.google.common.collect.MapMaker().weakKeys().makeMap();
+ 
+     public VillagerMakeLove() {
+         super(
+@@ -31,6 +_,15 @@
+     }
+ 
+     protected boolean checkExtraStartConditions(ServerLevel p_24623_, Villager p_24624_) {
++        // MCMT: drain a cooldown a partner's breed() queued for us (see breed()) before re-checking
++        // canBreed() below, on our own thread. This is the only gate every restart of this behavior passes
++        // through, so a villager can never start breeding again before its own queued cooldown lands, even
++        // though the cooldown may sit queued for a tick or two if we are not actively ticking this behavior
++        // when the partner's breed() runs.
++        if (MCMT_PENDING_COOLDOWN.remove(p_24624_) != null) {
++            p_24624_.setAge(6000);
++        }
++
+         return this.isBreedingPossible(p_24624_);
+     }
+ 
+@@ -108,10 +_,28 @@
+             return Optional.empty();
+         } else {
+             p_24657_.setAge(6000);
+-            p_24658_.setAge(6000);
++            // MCMT: p_24658_ is the breeding partner -- a different entity that may be ticking concurrently on
++            // another worker. Writing its `age` field here is the same cross-entity-state shape fixed for
++            // YieldJobSite's pathfinding in 3f91f03a6, but this is a write, not a read, and AgeableMob.setAge
++            // does more than assign the field: crossing the baby/adult sign boundary also flips the synced
++            // DATA_BABY_ID entity data and calls ageBoundaryReached(), which can call stopRiding(). A lock on
++            // the partner is not the answer here either, for the same deadlock reason as YieldJobSite: a
++            // mutual breeding pair can each be mid-breed() for the other at the same time.
++            //
++            // Route the partner's cooldown through the thread-safe pending set above instead, and only ever
++            // write `age` from the owning entity's own thread; checkExtraStartConditions drains it before that
++            // villager can next start breeding.
++            if (net.neoforged.neoforge.mcmt.MCMT.isPoolThread()) {
++                MCMT_PENDING_COOLDOWN.put(p_24658_, Boolean.TRUE);
++            } else {
++                p_24658_.setAge(6000);
++            }
++
              villager.setAge(-24000);
              villager.moveTo(p_24657_.getX(), p_24657_.getY(), p_24657_.getZ(), 0.0F, 0.0F);
              p_24656_.addFreshEntityWithPassengers(villager);
