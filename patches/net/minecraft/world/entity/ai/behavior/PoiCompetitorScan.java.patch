@@ -1,0 +1,82 @@
+--- a/net/minecraft/world/entity/ai/behavior/PoiCompetitorScan.java
++++ b/net/minecraft/world/entity/ai/behavior/PoiCompetitorScan.java
+@@ -14,6 +_,12 @@
+ import net.minecraft.world.entity.npc.VillagerProfession;
+ 
+ public class PoiCompetitorScan {
++    // MCMT: JOB_SITE erasures selectWinner() couldn't apply cross-thread, keyed by the villager that lost and
++    // valued by the exact GlobalPos it lost on. Weakly keyed so a villager that never comes back through this
++    // trigger again (dead, unloaded) doesn't pin its Villager object forever -- see the identical
++    // MCMT_PENDING_COOLDOWN leak fix in VillagerMakeLove.
++    private static final java.util.Map<Villager, GlobalPos> MCMT_PENDING_ERASE = new com.google.common.collect.MapMaker().weakKeys().makeMap();
++
+     public static BehaviorControl<Villager> create() {
+         return BehaviorBuilder.create(
+             p_258576_ -> p_258576_.group(p_258576_.present(MemoryModuleType.JOB_SITE), p_258576_.present(MemoryModuleType.NEAREST_LIVING_ENTITIES))
+@@ -21,6 +_,19 @@
+                         p_258576_,
+                         (p_258590_, p_258591_) -> (p_258580_, p_258581_, p_258582_) -> {
+                                 GlobalPos globalpos = p_258576_.get(p_258590_);
++                                // MCMT: drain an erase another villager's selectWinner() queued for us, on our own
++                                // thread, before running our own scan below. Unconditional and independent of
++                                // NEAREST_LIVING_ENTITIES: sensor visibility between two disputants isn't guaranteed
++                                // (see the comment in selectWinner), so we can't rely on rediscovering who flagged
++                                // us. Guarded against the current JOB_SITE memory, not just presence, so a claim we
++                                // legitimately re-acquired after the stale one was cleared some other way is never
++                                // wrongly erased by a leftover flag from the earlier dispute.
++                                GlobalPos pendingerase = MCMT_PENDING_ERASE.remove(p_258581_);
++                                if (pendingerase != null
++                                    && pendingerase.equals(p_258581_.getBrain().getMemory(MemoryModuleType.JOB_SITE).orElse(null))) {
++                                    p_258581_.getBrain().eraseMemory(MemoryModuleType.JOB_SITE);
++                                }
++
+                                 p_258580_.getPoiManager()
+                                     .getType(globalpos.pos())
+                                     .ifPresent(
+@@ -30,7 +_,7 @@
+                                                 .map(p_258583_ -> (Villager)p_258583_)
+                                                 .filter(LivingEntity::isAlive)
+                                                 .filter(p_258596_ -> competesForSameJobsite(globalpos, p_258588_, p_258596_))
+-                                                .reduce(p_258581_, PoiCompetitorScan::selectWinner)
++                                                .reduce(p_258581_, (p_mcmtA_, p_mcmtB_) -> selectWinner(p_mcmtA_, p_mcmtB_, p_258581_, globalpos))
+                                     );
+                                 return true;
+                             }
+@@ -38,7 +_,7 @@
+         );
+     }
+ 
+-    private static Villager selectWinner(Villager p_23725_, Villager p_23726_) {
++    private static Villager selectWinner(Villager p_23725_, Villager p_23726_, Villager self, GlobalPos globalpos) {
+         Villager villager;
+         Villager villager1;
+         if (p_23725_.getVillagerXp() > p_23726_.getVillagerXp()) {
+@@ -49,7 +_,27 @@
+             villager1 = p_23725_;
+         }
+ 
+-        villager1.getBrain().eraseMemory(MemoryModuleType.JOB_SITE);
++        // MCMT: villager1 (the loser) is not always `self`. The reduce above folds every nearby competitor
++        // pairwise, so once self loses once, the accumulator becomes the villager that beat it, and a later
++        // comparison in the same fold can then pit two OTHER villagers against each other. Erasing villager1's
++        // JOB_SITE memory reaches into a different entity's Brain map while that entity may be ticking
++        // concurrently on another worker -- the same cross-entity-state shape fixed for YieldJobSite's
++        // pathfinding in 3f91f03a6.
++        //
++        // A lock on villager1 is not the answer here either, for the same deadlock reason as YieldJobSite: A can
++        // be scanning B while B scans A. Nor can villager1 be trusted to rediscover the loss on its own: reduce()
++        // is only transitive if every disputant can see every other, but NEAREST_LIVING_ENTITIES sensor range is
++        // a per-pair radius, not a shared one -- A can have both B and C in range while B and C are outside each
++        // other's, so if A learns here that B lost to C, B may never independently see C to erase its own memory.
++        //
++        // Queue the erase instead: MCMT_PENDING_ERASE is drained unconditionally at the top of every villager's
++        // own trigger tick (see create() above), so villager1 erases its own JOB_SITE memory on its own thread
++        // the next time this behavior runs for it, regardless of whether it can currently see who it lost to.
++        if (self == villager1 || !net.neoforged.neoforge.mcmt.MCMT.isPoolThread()) {
++            villager1.getBrain().eraseMemory(MemoryModuleType.JOB_SITE);
++        } else {
++            MCMT_PENDING_ERASE.put(villager1, globalpos);
++        }
+         return villager;
+     }
+ 
