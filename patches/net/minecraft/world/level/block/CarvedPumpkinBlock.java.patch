@@ -1,0 +1,111 @@
+--- a/net/minecraft/world/level/block/CarvedPumpkinBlock.java
++++ b/net/minecraft/world/level/block/CarvedPumpkinBlock.java
+@@ -26,14 +_,25 @@
+ public class CarvedPumpkinBlock extends HorizontalDirectionalBlock {
+     public static final MapCodec<CarvedPumpkinBlock> CODEC = simpleCodec(CarvedPumpkinBlock::new);
+     public static final DirectionProperty FACING = HorizontalDirectionalBlock.FACING;
+-    @Nullable
+-    private BlockPattern snowGolemBase;
+-    @Nullable
+-    private BlockPattern snowGolemFull;
+-    @Nullable
+-    private BlockPattern ironGolemBase;
+-    @Nullable
+-    private BlockPattern ironGolemFull;
++    // MCMT: these four fields are lazily built by the getOrCreate* methods below, with the classic
++    // unguarded double-checked-lazy-init shape: `if (field == null) { field = build(); } return field;`.
++    // CarvedPumpkinBlock is a singleton shared by every level, and H1 ticks levels in parallel, so two
++    // dimensions spawning a golem at once can race here. This is the same unsafe-publication shape as
++    // `2d1576537`'s PalettedContainer fix: a reader on one worker can observe the non-null field reference
++    // before the BlockPattern object's own constructor writes are visible to it, and read a
++    // partially-constructed pattern. `volatile` is enough here -- unlike PalettedContainer's growable Data
++    // structure, each getOrCreate* builds one fully-formed, immutable BlockPattern into a local and then
++    // does a single publishing write, so the volatile write's happens-before edge is all a reader needs.
++    // Two levels racing the same lazy build just construct the (cheap, side-effect-free) pattern twice and
++    // agree on whichever write lands last; no lock is needed to keep that outcome correct.
++    @Nullable
++    private volatile BlockPattern snowGolemBase;
++    @Nullable
++    private volatile BlockPattern snowGolemFull;
++    @Nullable
++    private volatile BlockPattern ironGolemBase;
++    @Nullable
++    private volatile BlockPattern ironGolemFull;
+     private static final Predicate<BlockState> PUMPKINS_PREDICATE = p_51396_ -> p_51396_ != null
+             && (p_51396_.is(Blocks.CARVED_PUMPKIN) || p_51396_.is(Blocks.JACK_O_LANTERN));
+ 
+@@ -119,50 +_,62 @@
+     }
+ 
+     private BlockPattern getOrCreateSnowGolemBase() {
+-        if (this.snowGolemBase == null) {
+-            this.snowGolemBase = BlockPatternBuilder.start()
++        // MCMT: build into a local and publish with one volatile write; see the field comment above.
++        BlockPattern pattern = this.snowGolemBase;
++        if (pattern == null) {
++            pattern = BlockPatternBuilder.start()
+                 .aisle(" ", "#", "#")
+                 .where('#', BlockInWorld.hasState(BlockStatePredicate.forBlock(Blocks.SNOW_BLOCK)))
+                 .build();
++            this.snowGolemBase = pattern;
+         }
+ 
+-        return this.snowGolemBase;
++        return pattern;
+     }
+ 
+     private BlockPattern getOrCreateSnowGolemFull() {
+-        if (this.snowGolemFull == null) {
+-            this.snowGolemFull = BlockPatternBuilder.start()
++        // MCMT: build into a local and publish with one volatile write; see the field comment above.
++        BlockPattern pattern = this.snowGolemFull;
++        if (pattern == null) {
++            pattern = BlockPatternBuilder.start()
+                 .aisle("^", "#", "#")
+                 .where('^', BlockInWorld.hasState(PUMPKINS_PREDICATE))
+                 .where('#', BlockInWorld.hasState(BlockStatePredicate.forBlock(Blocks.SNOW_BLOCK)))
+                 .build();
++            this.snowGolemFull = pattern;
+         }
+ 
+-        return this.snowGolemFull;
++        return pattern;
+     }
+ 
+     private BlockPattern getOrCreateIronGolemBase() {
+-        if (this.ironGolemBase == null) {
+-            this.ironGolemBase = BlockPatternBuilder.start()
++        // MCMT: build into a local and publish with one volatile write; see the field comment above.
++        BlockPattern pattern = this.ironGolemBase;
++        if (pattern == null) {
++            pattern = BlockPatternBuilder.start()
+                 .aisle("~ ~", "###", "~#~")
+                 .where('#', BlockInWorld.hasState(BlockStatePredicate.forBlock(Blocks.IRON_BLOCK)))
+                 .where('~', p_284869_ -> p_284869_.getState().isAir())
+                 .build();
++            this.ironGolemBase = pattern;
+         }
+ 
+-        return this.ironGolemBase;
++        return pattern;
+     }
+ 
+     private BlockPattern getOrCreateIronGolemFull() {
+-        if (this.ironGolemFull == null) {
+-            this.ironGolemFull = BlockPatternBuilder.start()
++        // MCMT: build into a local and publish with one volatile write; see the field comment above.
++        BlockPattern pattern = this.ironGolemFull;
++        if (pattern == null) {
++            pattern = BlockPatternBuilder.start()
+                 .aisle("~^~", "###", "~#~")
+                 .where('^', BlockInWorld.hasState(PUMPKINS_PREDICATE))
+                 .where('#', BlockInWorld.hasState(BlockStatePredicate.forBlock(Blocks.IRON_BLOCK)))
+                 .where('~', p_284868_ -> p_284868_.getState().isAir())
+                 .build();
++            this.ironGolemFull = pattern;
+         }
+ 
+-        return this.ironGolemFull;
++        return pattern;
+     }
+ }
